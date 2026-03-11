@@ -1,0 +1,44 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "aer-plugin-template"
+version = "1.1.0"
+description = "A template code repo for aer plugins"
+readme = "README.md"
+requires-python = ">=3.13"
+license = "MIT"
+authors = [{ name = "Fran Dorr" }]
+dependencies = ["aer-core"]
+
+[tool.uv]
+managed = true
+add-bounds = "major"
+
+[tool.uv.workspace]
+members = ["projects/*"]
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.hatch.build]
+dev-mode-dirs = ["components", "bases", "development", "."]
+
+[tool.ruff]
+exclude = [
+    ".git",
+    ".github",
+    "__pycache__",
+    ".mypy_cache",
+    ".ruff_cache",
+    "dist",
+    ".venv",
+    "./development/*.py",
+]
+line-length = 120
+
+[tool.basedpyright]
+venvPath = "."
+venv = ".venv"
+extraPaths = ["components/", "bases/"]
