@@ -102,31 +102,55 @@ def extract_aws_goes(
             scene.load(dataset_names)
             scene = harmonize_reflectance(scene)
 
-            # Resample based on spatial extent area_def
             spatial_ext = valid.iloc[0].get("overlapping_spatial_extent")
-            area_def = spatial_ext.area_def if spatial_ext is not None and hasattr(spatial_ext, "area_def") else None
+            grid_cells = (
+                spatial_ext.grid_cells if spatial_ext is not None and hasattr(spatial_ext, "grid_cells") else []
+            )
 
-            if area_def:
-                scene = scene.resample(area_def)
+            output_format = options.get("output_format", "nc")
 
-            output_format = options.get("output_format", "netcdf")
-            datasets_loaded = list(scene.keys())
+            if grid_cells:
+                for grid_cell in grid_cells:
+                    # resolution is a float in the signature, GridCell needs int
+                    res_int = int(resolution)
+                    area_def = grid_cell.area_def(res_int)
+                    datasets_loaded = list(scene.keys())
+                    resampled_scn = scene.resample(
+                        destination=area_def,
+                        datasets=datasets_loaded,
+                        resampler="nearest",
+                        generate_data=False,
+                        unload=False,
+                    )
+                    
+                    datasets_loaded = list(resampled_scn.keys())
+                    if datasets_loaded:
+                        cell_id = grid_cell.area_name(res_int)
+                        out_file = dest_path / f"extracted_{reader}_{cell_id}.{output_format}"
 
-            if datasets_loaded:
-                out_file = dest_path / f"extracted_{reader}.{output_format}"
-                if output_format == "netcdf":
-                    # netcdf needs cf writer
-                    scene.save_datasets(filename=str(out_file), writer="cf")
-                else:
-                    # e.g., geotiff
-                    scene.save_datasets(filename=str(out_file), writer="geotiff")
+                        if output_format == "nc" or output_format == "netcdf":
+                            resampled_scn.save_datasets(filename=str(out_file), writer="cf")
+                        else:
+                            resampled_scn.save_datasets(filename=str(out_file), writer="geotiff")
 
-                # Mapping back to the DataFrame: for simplicity, we replicate the first matched row
-                # The ExtractedResultSchema extends SearchResultSchema.
-                rep_row = valid.iloc[0].copy()
-                rep_row["reprojected_path"] = str(out_file)
-                rep_row["resolution"] = float(resolution)
-                output_rows.append(rep_row)
+                        rep_row = valid.iloc[0].copy()
+                        rep_row["reprojected_path"] = str(out_file)
+                        rep_row["resolution"] = float(resolution)
+                        output_rows.append(rep_row)
+            else:
+                # No spatial extent provided, just save raw scene
+                datasets_loaded = list(scene.keys())
+                if datasets_loaded:
+                    out_file = dest_path / f"extracted_{reader}.{output_format}"
+                    if output_format == "nc" or output_format == "netcdf":
+                        scene.save_datasets(filename=str(out_file), writer="cf")
+                    else:
+                        scene.save_datasets(filename=str(out_file), writer="geotiff")
+
+                    rep_row = valid.iloc[0].copy()
+                    rep_row["reprojected_path"] = str(out_file)
+                    rep_row["resolution"] = float(resolution)
+                    output_rows.append(rep_row)
 
         except Exception as exc:
             logger.error("extraction_failed", reader=reader, error=str(exc))

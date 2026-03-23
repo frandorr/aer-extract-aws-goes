@@ -33,8 +33,12 @@ def test_extract_aws_goes(mock_scene_cls: MagicMock, mock_download: MagicMock, t
     # 1. Setup mock downloaded result dataframe conforming to DownloadedResultSchema
     local_path = tmp_path / "OR_ABI-L1b-RadC-M6C01_G16_s20202151301170.nc"
 
+    mock_grid_cell = MagicMock()
+    mock_grid_cell.area_def.return_value = "dummy_area_def"
+    mock_grid_cell.area_name.return_value = "0A_0B"
+
     mock_extent = MagicMock()
-    mock_extent.area_def = "dummy_area_def"
+    mock_extent.grid_cells = [mock_grid_cell]
 
     download_data = {
         "product_name": ["ABI-L1b-RadC"],
@@ -72,7 +76,13 @@ def test_extract_aws_goes(mock_scene_cls: MagicMock, mock_download: MagicMock, t
     result = extract_aws_goes(input_gdf, dest_dir=tmp_path, resolution=500.0)
 
     # 5. Assertions
-    mock_scene.resample.assert_called_once_with("dummy_area_def")
+    mock_scene.resample.assert_called_once_with(
+        destination="dummy_area_def",
+        datasets=["C01"],
+        resampler="nearest",
+        generate_data=False,
+        unload=False,
+    )
 
     assert "reprojected_path" in result.columns
     assert "resolution" in result.columns
