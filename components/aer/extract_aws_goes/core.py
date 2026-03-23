@@ -88,21 +88,27 @@ def extract_aws_goes(
     local_files = [Path(p) for p in valid["local_path"].dropna()]
     grouped = group_files_by_reader(local_files)
 
-    # 2. Extract using satpy
+    # 2. Collect requested band IDs from the GDF's channels column
+    requested_band_ids: set[str] = set()
+    if "channels" in valid.columns:
+        for ch_tuple in valid["channels"].dropna():
+            for ch in ch_tuple:
+                if hasattr(ch, "c_id"):
+                    requested_band_ids.add(ch.c_id)
+
+    # 3. Extract using satpy
     output_rows: list[Any] = []
     to_be_computed: list[Any] = []
     output_format = options.get("output_format", "nc")
-    # Allow caller to restrict which bands to load (default: all available)
-    requested_bands: set[str] | None = options.get("bands", None)
 
     for reader, files in grouped.items():
         try:
             scene = satpy.Scene(filenames=[str(f) for f in files], reader=reader)
             available = set(scene.available_dataset_names())
 
-            # Only load requested bands that are actually available
-            if requested_bands:
-                bands_to_load = list(available & requested_bands)
+            # Only load bands present in the channels column (if any)
+            if requested_band_ids:
+                bands_to_load = list(available & requested_band_ids)
             else:
                 bands_to_load = list(available)
 
@@ -110,7 +116,7 @@ def extract_aws_goes(
                 logger.warning(
                     "no_matching_bands",
                     reader=reader,
-                    requested=requested_bands,
+                    requested=requested_band_ids,
                     available=available,
                 )
                 continue

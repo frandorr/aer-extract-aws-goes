@@ -46,6 +46,9 @@ def test_extract_aws_goes(
     mock_extent = MagicMock()
     mock_extent.grid_cells = [mock_grid_cell]
 
+    mock_channel = MagicMock()
+    mock_channel.c_id = "C01"
+
     download_data = {
         "product_name": ["ABI-L1b-RadC"],
         "granule_id": ["G16_s20202151301170"],
@@ -58,6 +61,7 @@ def test_extract_aws_goes(
         "overlapping_spatial_extent": [mock_extent],
         "input_spatial_extent": [None],
         "cell_overlap_mode": ["contains"],
+        "channels": [(mock_channel,)],
         "local_path": [str(local_path)],
         "download_status": ["complete"],
     }
