@@ -32,6 +32,10 @@ def test_group_files_by_reader() -> None:
 def test_extract_aws_goes(mock_scene_cls: MagicMock, mock_download: MagicMock, tmp_path: Path) -> None:
     # 1. Setup mock downloaded result dataframe conforming to DownloadedResultSchema
     local_path = tmp_path / "OR_ABI-L1b-RadC-M6C01_G16_s20202151301170.nc"
+
+    mock_extent = MagicMock()
+    mock_extent.area_def = "dummy_area_def"
+
     download_data = {
         "product_name": ["ABI-L1b-RadC"],
         "granule_id": ["G16_s20202151301170"],
@@ -41,7 +45,7 @@ def test_extract_aws_goes(mock_scene_cls: MagicMock, mock_download: MagicMock, t
         "https_url": ["https://noaa-goes16.s3.amazonaws.com/..."],
         "size_mb": [10.5],
         "geometry": [Point(0, 0)],
-        "overlapping_spatial_extent": [None],
+        "overlapping_spatial_extent": [mock_extent],
         "input_spatial_extent": [None],
         "cell_overlap_mode": ["contains"],
         "local_path": [str(local_path)],
@@ -56,21 +60,24 @@ def test_extract_aws_goes(mock_scene_cls: MagicMock, mock_download: MagicMock, t
     mock_scene = MagicMock()
     mock_scene.available_dataset_names.return_value = ["C01"]
     mock_scene.keys.return_value = ["C01"]
-    # return `self` from harmonize to mock the pipeline properly
-    mock_scene.return_value = mock_scene
+
+    # Mock chain properly for harmonize and resample
+    mock_scene.resample.return_value = mock_scene
     mock_scene_cls.return_value = mock_scene
 
     # 3. Create input dummy search result
     input_gdf = GeoDataFrame(pd.DataFrame(download_data), geometry="geometry", crs="EPSG:4326")
 
     # 4. Invoke extraction
-    result = extract_aws_goes(input_gdf, dest_dir=tmp_path)
+    result = extract_aws_goes(input_gdf, dest_dir=tmp_path, resolution=500.0)
 
     # 5. Assertions
+    mock_scene.resample.assert_called_once_with("dummy_area_def")
+
     assert "reprojected_path" in result.columns
     assert "resolution" in result.columns
     assert len(result) == 1
+    assert result.iloc[0]["resolution"] == 500.0
 
     # Check that ExtractedResultSchema validates the dataframe
-    # pandera schema `.validate()` throws an exception if invalid.
     ExtractedResultSchema.validate(result)

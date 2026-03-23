@@ -56,6 +56,7 @@ def harmonize_reflectance(scene: satpy.Scene) -> satpy.Scene:
 def extract_aws_goes(
     search_result: GeoDataFrame[SearchResultSchema],
     dest_dir: Path | str,
+    resolution: float = 2000.0,
     **options: Any,
 ) -> GeoDataFrame[ExtractedResultSchema]:
     """Extract AWS GOES data for the given search results using Satpy.
@@ -63,8 +64,9 @@ def extract_aws_goes(
     Args:
         search_result: The search results to download and extract.
         dest_dir: Base directory where local files and extracted output will be saved.
+        resolution: Target resolution for extraction (default 2000.0).
         **options: Additional options matching the ExtractPlugin protocol
-                   (e.g., area_def, output_format).
+                   (e.g., output_format).
 
     Returns:
         A GeoDataFrame conforming to ExtractedResultSchema.
@@ -100,8 +102,10 @@ def extract_aws_goes(
             scene.load(dataset_names)
             scene = harmonize_reflectance(scene)
 
-            # Resample if area definition is provided
-            area_def = options.get("area_def")
+            # Resample based on spatial extent area_def
+            spatial_ext = valid.iloc[0].get("overlapping_spatial_extent")
+            area_def = spatial_ext.area_def if spatial_ext is not None and hasattr(spatial_ext, "area_def") else None
+
             if area_def:
                 scene = scene.resample(area_def)
 
@@ -121,7 +125,7 @@ def extract_aws_goes(
                 # The ExtractedResultSchema extends SearchResultSchema.
                 rep_row = valid.iloc[0].copy()
                 rep_row["reprojected_path"] = str(out_file)
-                rep_row["resolution"] = float(options.get("resolution", 2000.0))
+                rep_row["resolution"] = float(resolution)
                 output_rows.append(rep_row)
 
         except Exception as exc:
