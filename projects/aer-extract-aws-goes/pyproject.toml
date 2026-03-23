@@ -1,0 +1,37 @@
+[build-system]
+requires = ["hatchling", "hatch-polylith-bricks"]
+build-backend = "hatchling.build"
+
+[project]
+name = "aer-extract-aws-goes"
+version = "0.1.0"
+description = "Polylith project for the extract-aws-goes plugin"
+readme = "README.md"
+authors = [{ name = "Fran Dorr" }]
+
+requires-python = ">=3.13"
+
+dependencies = [
+    "aer-core",
+    "attrs>=25.4.0",
+    "pendulum>=3.2.0",
+    "pyresample>=1.35.0",
+    "satpy>=0.60.0",
+    "typeguard>=4.5.1",
+    "xarray>=2026.2.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/frandorr/aer-extract-aws-goes"
+Issues = "https://github.com/frandorr/aer-extract-aws-goes/issues"
+Repository = "https://github.com/frandorr/aer-extract-aws-goes"
+
+[project.entry-points."aer.plugins"]
+extract_aws_goes = "aer.extract_aws_goes.core:extract_aws_goes"
+
+[tool.hatch]
+build.hooks.polylith-bricks = {}
+build.targets.wheel.packages = ["aer"]
+
+[tool.polylith]
+bricks."../../components/aer/extract_aws_goes" = "aer/extract_aws_goes"

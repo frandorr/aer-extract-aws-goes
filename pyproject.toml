@@ -3,18 +3,27 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "aer-plugin-template"
+name = "aer"
 version = "1.1.0"
 description = "A template code repo for aer plugins"
 readme = "README.md"
 requires-python = ">=3.13"
 license = "MIT"
 authors = [{ name = "Fran Dorr" }]
-dependencies = ["aer-core"]
+dependencies = [
+    "aer-core>=1.2.0",
+    "aer-search-aws-goes>=2.1.0",
+    "attrs>=25.4.0",
+    "pendulum>=3.2.0",
+    "pyarrow>=23.0.1",
+    "pyresample>=1.35.0",
+    "satpy>=0.60.0",
+    "typeguard>=4.5.1",
+    "xarray>=2026.2.0",
+]
 
 [tool.uv]
 managed = true
-add-bounds = "major"
 
 [tool.uv.workspace]
 members = ["projects/*"]
@@ -42,3 +51,11 @@ line-length = 120
 venvPath = "."
 venv = ".venv"
 extraPaths = ["components/", "bases/"]
+
+[dependency-groups]
+dev = [
+    "aer-search-aws-goes>=2.1.0,<3.0.0",
+    "polylith-cli>=1.43.0,<2.0.0",
+    "pytest>=9.0.2,<10.0.0",
+    "python-semantic-release>=10.5.3,<11.0.0",
+]
