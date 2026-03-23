@@ -81,34 +81,6 @@ def harmonize_reflectance(scene: satpy.Scene) -> satpy.Scene:
     return scene
 
 
-def _collect_unique_grid_cells(valid_gdf: pd.DataFrame) -> list[Any]:
-    """Collect unique grid cells across all rows' overlapping_spatial_extent."""
-    seen_cells: set[Any] = set()
-    all_cells: list[Any] = []
-    if "overlapping_spatial_extent" not in valid_gdf.columns:
-        return all_cells
-
-    for spatial_ext in valid_gdf["overlapping_spatial_extent"].dropna():
-        if hasattr(spatial_ext, "grid_cells"):
-            for cell in spatial_ext.grid_cells:
-                if cell not in seen_cells:
-                    seen_cells.add(cell)
-                    all_cells.append(cell)
-    return all_cells
-
-
-def _collect_channel_ids(valid_gdf: pd.DataFrame) -> set[str]:
-    """Collect all unique channel c_ids from the channels column."""
-    ids: set[str] = set()
-    if "channels" not in valid_gdf.columns:
-        return ids
-    for ch_tuple in valid_gdf["channels"].dropna():
-        for ch in ch_tuple:
-            if hasattr(ch, "c_id"):
-                ids.add(ch.c_id)
-    return ids
-
-
 @plugin(name="aws_goes", category="extract")
 def extract_aws_goes(
     search_result: GeoDataFrame[SearchResultSchema],
@@ -118,15 +90,14 @@ def extract_aws_goes(
 ) -> GeoDataFrame[ExtractedResultSchema]:
     """Extract AWS GOES data for the given search results using Satpy.
 
-    Supports per-row ``channels`` and ``overlapping_spatial_extent``.
-    All unique grid cells across rows are collected, and all requested
-    channel IDs are unioned for loading.
+    Processes EACH row of the search result individually, using the row-specific
+    ``channels`` and ``overlapping_spatial_extent``.
 
     Args:
         search_result: The search results to download and extract.
         dest_dir: Base directory where local files and extracted output will be saved.
         resolution: Target resolution for extraction (default 2000.0).
-        **options: Additional options (e.g., output_format).
+        **options: Additional options.
 
     Returns:
         A GeoDataFrame conforming to ExtractedResultSchema.
@@ -144,28 +115,33 @@ def extract_aws_goes(
         valid["resolution"] = pd.Series(dtype=float)
         return valid  # type: ignore
 
-    local_files = [Path(p) for p in valid["local_path"].dropna()]
-    grouped = group_files_by_reader(local_files)
-
-    # 2. Collect all requested band IDs and unique grid cells across ALL rows
-    requested_channel_ids = _collect_channel_ids(valid)
-    all_grid_cells = _collect_unique_grid_cells(valid)
-
-    # 3. Extract using satpy
+    # 2. Extract using satpy row-by-row
     output_rows: list[Any] = []
     to_be_computed: list[Any] = []
     output_format = options.get("output_format", "nc")
     res_int = int(resolution)
 
-    for reader, files in grouped.items():
+    for _, row in valid.iterrows():
+        local_path = Path(row["local_path"])
+        reader = detect_reader(local_path.name)
+        if not reader:
+            continue
+
         try:
-            scene = satpy.Scene(filenames=[str(f) for f in files], reader=reader)
+            # Create scene for this specific file
+            scene = satpy.Scene(filenames=[str(local_path)], reader=reader)
             available = set(scene.available_dataset_names())
 
-            # Map channel c_ids → satpy dataset names (handles "1" → "C01")
-            if requested_channel_ids:
+            # Row-specific channel selection
+            row_channel_ids = set()
+            if "channels" in valid.columns and row["channels"]:
+                for ch in row["channels"]:
+                    if hasattr(ch, "c_id"):
+                        row_channel_ids.add(ch.c_id)
+
+            if row_channel_ids:
                 bands_to_load = map_channel_ids_to_satpy_names(
-                    requested_channel_ids, available
+                    row_channel_ids, available
                 )
             else:
                 bands_to_load = list(available)
@@ -173,8 +149,8 @@ def extract_aws_goes(
             if not bands_to_load:
                 logger.warning(
                     "no_matching_bands",
-                    reader=reader,
-                    requested=requested_channel_ids,
+                    filename=local_path.name,
+                    requested=row_channel_ids,
                     available=available,
                 )
                 continue
@@ -182,8 +158,21 @@ def extract_aws_goes(
             scene.load(bands_to_load)
             scene = harmonize_reflectance(scene)
 
-            if all_grid_cells:
-                for grid_cell in all_grid_cells:
+            # Row-specific grid cells
+            spatial_ext = row["overlapping_spatial_extent"]
+            grid_cells = (
+                spatial_ext.grid_cells
+                if spatial_ext is not None and hasattr(spatial_ext, "grid_cells")
+                else []
+            )
+
+            # Cleanup granule_id by removing common extensions (.nc)
+            granule_id = str(row["granule_id"])
+            if granule_id.endswith(".nc"):
+                granule_id = granule_id[:-3]
+
+            if grid_cells:
+                for grid_cell in grid_cells:
                     area_def = grid_cell.area_def(res_int)
                     resampled_scn = scene.resample(
                         destination=area_def,
@@ -193,7 +182,7 @@ def extract_aws_goes(
 
                     cell_id = grid_cell.area_name(res_int)
                     out_file = (
-                        dest_path / f"extracted_{reader}_{cell_id}.{output_format}"
+                        dest_path / f"extracted_{granule_id}_{cell_id}.{output_format}"
                     )
 
                     if output_format in ("nc", "netcdf"):
@@ -208,7 +197,7 @@ def extract_aws_goes(
                     if delayed:
                         to_be_computed.extend(delayed)
 
-                    rep_row = valid.iloc[0].copy()
+                    rep_row = row.copy()
                     rep_row["reprojected_path"] = str(out_file)
                     rep_row["resolution"] = float(resolution)
                     output_rows.append(rep_row)
@@ -216,7 +205,7 @@ def extract_aws_goes(
                     del resampled_scn
             else:
                 # No spatial extent — save raw scene
-                out_file = dest_path / f"extracted_{reader}.{output_format}"
+                out_file = dest_path / f"extracted_{granule_id}.{output_format}"
                 if output_format in ("nc", "netcdf"):
                     delayed = scene.save_datasets(
                         filename=str(out_file), writer="cf", compute=False
@@ -228,7 +217,7 @@ def extract_aws_goes(
                 if delayed:
                     to_be_computed.extend(delayed)
 
-                rep_row = valid.iloc[0].copy()
+                rep_row = row.copy()
                 rep_row["reprojected_path"] = str(out_file)
                 rep_row["resolution"] = float(resolution)
                 output_rows.append(rep_row)
@@ -236,7 +225,7 @@ def extract_aws_goes(
             del scene
 
         except Exception as exc:
-            logger.error("extraction_failed", reader=reader, error=str(exc))
+            logger.error("extraction_failed", filename=local_path.name, error=str(exc))
 
     # Batch-compute all deferred writes
     if to_be_computed:
