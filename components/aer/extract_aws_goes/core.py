@@ -12,6 +12,7 @@ from aer.plugin import plugin
 from aer.search import SearchResultSchema
 from aer.settings.core import ENV_SETTINGS
 from pandera.typing.geopandas import GeoDataFrame
+from satpy.writers.core.compute import compute_writer_results
 
 logger = get_logger()
 
@@ -66,7 +67,7 @@ def extract_aws_goes(
         dest_dir: Base directory where local files and extracted output will be saved.
         resolution: Target resolution for extraction (default 2000.0).
         **options: Additional options matching the ExtractPlugin protocol
-                   (e.g., output_format).
+                   (e.g., output_format, bands).
 
     Returns:
         A GeoDataFrame conforming to ExtractedResultSchema.
@@ -80,7 +81,6 @@ def extract_aws_goes(
     valid = downloaded[downloaded["download_status"] == "complete"].copy()
     if valid.empty:
         logger.warning("no_files_downloaded")
-        # Return empty dataframe with correct schema columns
         valid["reprojected_path"] = pd.Series(dtype=str)
         valid["resolution"] = pd.Series(dtype=float)
         return valid  # type: ignore
@@ -89,71 +89,103 @@ def extract_aws_goes(
     grouped = group_files_by_reader(local_files)
 
     # 2. Extract using satpy
-    output_rows = []
+    output_rows: list[Any] = []
+    to_be_computed: list[Any] = []
+    output_format = options.get("output_format", "nc")
+    # Allow caller to restrict which bands to load (default: all available)
+    requested_bands: set[str] | None = options.get("bands", None)
 
     for reader, files in grouped.items():
         try:
             scene = satpy.Scene(filenames=[str(f) for f in files], reader=reader)
-            # Use available datasets, or default to all
-            dataset_names = scene.available_dataset_names()
-            if not dataset_names:
+            available = set(scene.available_dataset_names())
+
+            # Only load requested bands that are actually available
+            if requested_bands:
+                bands_to_load = list(available & requested_bands)
+            else:
+                bands_to_load = list(available)
+
+            if not bands_to_load:
+                logger.warning(
+                    "no_matching_bands",
+                    reader=reader,
+                    requested=requested_bands,
+                    available=available,
+                )
                 continue
 
-            scene.load(dataset_names)
+            scene.load(bands_to_load)
             scene = harmonize_reflectance(scene)
 
+            # Get grid cells from the spatial extent
             spatial_ext = valid.iloc[0].get("overlapping_spatial_extent")
             grid_cells = (
-                spatial_ext.grid_cells if spatial_ext is not None and hasattr(spatial_ext, "grid_cells") else []
+                spatial_ext.grid_cells
+                if spatial_ext is not None and hasattr(spatial_ext, "grid_cells")
+                else []
             )
 
-            output_format = options.get("output_format", "nc")
-
             if grid_cells:
+                res_int = int(resolution)
                 for grid_cell in grid_cells:
-                    # resolution is a float in the signature, GridCell needs int
-                    res_int = int(resolution)
                     area_def = grid_cell.area_def(res_int)
-                    datasets_loaded = list(scene.keys())
                     resampled_scn = scene.resample(
                         destination=area_def,
-                        datasets=datasets_loaded,
+                        datasets=bands_to_load,
                         resampler="nearest",
-                        generate_data=False,
-                        unload=False,
                     )
-                    
-                    datasets_loaded = list(resampled_scn.keys())
-                    if datasets_loaded:
-                        cell_id = grid_cell.area_name(res_int)
-                        out_file = dest_path / f"extracted_{reader}_{cell_id}.{output_format}"
 
-                        if output_format == "nc" or output_format == "netcdf":
-                            resampled_scn.save_datasets(filename=str(out_file), writer="cf")
-                        else:
-                            resampled_scn.save_datasets(filename=str(out_file), writer="geotiff")
+                    cell_id = grid_cell.area_name(res_int)
+                    out_file = dest_path / f"extracted_{reader}_{cell_id}.{output_format}"
 
-                        rep_row = valid.iloc[0].copy()
-                        rep_row["reprojected_path"] = str(out_file)
-                        rep_row["resolution"] = float(resolution)
-                        output_rows.append(rep_row)
-            else:
-                # No spatial extent provided, just save raw scene
-                datasets_loaded = list(scene.keys())
-                if datasets_loaded:
-                    out_file = dest_path / f"extracted_{reader}.{output_format}"
-                    if output_format == "nc" or output_format == "netcdf":
-                        scene.save_datasets(filename=str(out_file), writer="cf")
+                    if output_format in ("nc", "netcdf"):
+                        delayed = resampled_scn.save_datasets(
+                            filename=str(out_file), writer="cf", compute=False
+                        )
                     else:
-                        scene.save_datasets(filename=str(out_file), writer="geotiff")
+                        delayed = resampled_scn.save_datasets(
+                            filename=str(out_file), writer="geotiff", compute=False
+                        )
+
+                    if delayed:
+                        to_be_computed.extend(delayed)
 
                     rep_row = valid.iloc[0].copy()
                     rep_row["reprojected_path"] = str(out_file)
                     rep_row["resolution"] = float(resolution)
                     output_rows.append(rep_row)
 
+                    # Free resampled scene to avoid OOM
+                    del resampled_scn
+            else:
+                # No spatial extent provided — save raw scene
+                out_file = dest_path / f"extracted_{reader}.{output_format}"
+                if output_format in ("nc", "netcdf"):
+                    delayed = scene.save_datasets(
+                        filename=str(out_file), writer="cf", compute=False
+                    )
+                else:
+                    delayed = scene.save_datasets(
+                        filename=str(out_file), writer="geotiff", compute=False
+                    )
+                if delayed:
+                    to_be_computed.extend(delayed)
+
+                rep_row = valid.iloc[0].copy()
+                rep_row["reprojected_path"] = str(out_file)
+                rep_row["resolution"] = float(resolution)
+                output_rows.append(rep_row)
+
+            # Free original scene after processing all grid cells for this reader
+            del scene
+
         except Exception as exc:
             logger.error("extraction_failed", reader=reader, error=str(exc))
+
+    # Batch-compute all deferred writes at once (memory-efficient)
+    if to_be_computed:
+        compute_writer_results(to_be_computed)
 
     if not output_rows:
         valid["reprojected_path"] = pd.Series(dtype=str)

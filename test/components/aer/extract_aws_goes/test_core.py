@@ -27,9 +27,15 @@ def test_group_files_by_reader() -> None:
     assert len(grouped.get("abi_l2_nc", [])) == 1
 
 
+@patch("aer.extract_aws_goes.core.compute_writer_results")
 @patch("aer.extract_aws_goes.core.download")
 @patch("aer.extract_aws_goes.core.satpy.Scene")
-def test_extract_aws_goes(mock_scene_cls: MagicMock, mock_download: MagicMock, tmp_path: Path) -> None:
+def test_extract_aws_goes(
+    mock_scene_cls: MagicMock,
+    mock_download: MagicMock,
+    mock_compute: MagicMock,
+    tmp_path: Path,
+) -> None:
     # 1. Setup mock downloaded result dataframe conforming to DownloadedResultSchema
     local_path = tmp_path / "OR_ABI-L1b-RadC-M6C01_G16_s20202151301170.nc"
 
@@ -62,11 +68,14 @@ def test_extract_aws_goes(mock_scene_cls: MagicMock, mock_download: MagicMock, t
 
     # 2. Setup mock satpy Scene
     mock_scene = MagicMock()
-    mock_scene.available_dataset_names.return_value = ["C01"]
+    mock_scene.available_dataset_names.return_value = {"C01"}
     mock_scene.keys.return_value = ["C01"]
 
-    # Mock chain properly for harmonize and resample
-    mock_scene.resample.return_value = mock_scene
+    # Mock chain properly for resample
+    mock_resampled = MagicMock()
+    mock_resampled.keys.return_value = ["C01"]
+    mock_resampled.save_datasets.return_value = ["delayed_result"]
+    mock_scene.resample.return_value = mock_resampled
     mock_scene_cls.return_value = mock_scene
 
     # 3. Create input dummy search result
@@ -80,9 +89,10 @@ def test_extract_aws_goes(mock_scene_cls: MagicMock, mock_download: MagicMock, t
         destination="dummy_area_def",
         datasets=["C01"],
         resampler="nearest",
-        generate_data=False,
-        unload=False,
     )
+
+    # Verify deferred compute was called
+    mock_compute.assert_called_once()
 
     assert "reprojected_path" in result.columns
     assert "resolution" in result.columns
