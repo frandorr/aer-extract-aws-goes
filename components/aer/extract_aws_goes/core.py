@@ -63,7 +63,7 @@ def extract_aws_goes(
     Args:
         search_result: The search results to download and extract.
         dest_dir: Base directory where local files and extracted output will be saved.
-        **options: Additional options matching the ExtractPlugin protocol 
+        **options: Additional options matching the ExtractPlugin protocol
                    (e.g., area_def, output_format).
 
     Returns:

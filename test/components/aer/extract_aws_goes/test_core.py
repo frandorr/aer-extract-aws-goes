@@ -10,18 +10,9 @@ from aer.extract_aws_goes.core import detect_reader, extract_aws_goes, group_fil
 
 
 def test_detect_reader() -> None:
-    assert (
-        detect_reader("OR_ABI-L1b-RadC-M6C01_G16_s20202151301170_e20202151303543_c20202151304033.nc")
-        == "abi_l1b"
-    )
-    assert (
-        detect_reader("OR_ABI-L2-AODC-M6_G16_s20202151301170_e20202151303543_c20202151305215.nc")
-        == "abi_l2_nc"
-    )
-    assert (
-        detect_reader("OR_ABI-L2-BRFC-M6_G16_s20202151301170_e20202151303543_c20202151305215.nc")
-        == "abi_l2_brf_nc"
-    )
+    assert detect_reader("OR_ABI-L1b-RadC-M6C01_G16_s20202151301170_e20202151303543_c20202151304033.nc") == "abi_l1b"
+    assert detect_reader("OR_ABI-L2-AODC-M6_G16_s20202151301170_e20202151303543_c20202151305215.nc") == "abi_l2_nc"
+    assert detect_reader("OR_ABI-L2-BRFC-M6_G16_s20202151301170_e20202151303543_c20202151305215.nc") == "abi_l2_brf_nc"
     assert detect_reader("UNKNOWN.nc") is None
 
 
@@ -56,7 +47,7 @@ def test_extract_aws_goes(mock_scene_cls: MagicMock, mock_download: MagicMock, t
         "local_path": [str(local_path)],
         "download_status": ["complete"],
     }
-    
+
     # Needs a GeoDataFrame since download() returns one
     downloaded_gdf = GeoDataFrame(pd.DataFrame(download_data), geometry="geometry", crs="EPSG:4326")
     mock_download.return_value = downloaded_gdf
@@ -66,12 +57,12 @@ def test_extract_aws_goes(mock_scene_cls: MagicMock, mock_download: MagicMock, t
     mock_scene.available_dataset_names.return_value = ["C01"]
     mock_scene.keys.return_value = ["C01"]
     # return `self` from harmonize to mock the pipeline properly
-    mock_scene.return_value = mock_scene 
+    mock_scene.return_value = mock_scene
     mock_scene_cls.return_value = mock_scene
 
     # 3. Create input dummy search result
     input_gdf = GeoDataFrame(pd.DataFrame(download_data), geometry="geometry", crs="EPSG:4326")
-    
+
     # 4. Invoke extraction
     result = extract_aws_goes(input_gdf, dest_dir=tmp_path)
 
@@ -79,8 +70,7 @@ def test_extract_aws_goes(mock_scene_cls: MagicMock, mock_download: MagicMock, t
     assert "reprojected_path" in result.columns
     assert "resolution" in result.columns
     assert len(result) == 1
-    
+
     # Check that ExtractedResultSchema validates the dataframe
     # pandera schema `.validate()` throws an exception if invalid.
     ExtractedResultSchema.validate(result)
-
