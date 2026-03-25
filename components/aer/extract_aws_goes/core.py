@@ -102,7 +102,7 @@ def extract_aws_goes(task: ExtractionTask) -> ExtractionTask:
         area_def = grid_cell.area_def(channel.resolution)
         area_name = grid_cell.area_name(channel.resolution)
 
-        resampled = scene.resample(area_def, datasets=mapped)
+        resampled = scene.resample(area_def, datasets=mapped, generate=False, unload=True, resampler="nearest")
         tif_name = f"{area_name}.tif"
         result = resampled.save_datasets(
             writer="geotiff",
