@@ -45,6 +45,7 @@ def map_channel_ids_to_satpy_names(channel_ids: set[str], available_names: set[s
                 result.append(padded)
     return result
 
+
 @plugin("aws_goes", "extract")
 def extract_aws_goes(task: ExtractionTask, **kwargs) -> ExtractionTask:
     """Extract GOES satellite data from AWS using satpy.
@@ -106,8 +107,9 @@ def extract_aws_goes(task: ExtractionTask, **kwargs) -> ExtractionTask:
         area_name = grid_cell.area_name(channel.resolution)
 
         resampled = scene.resample(area_def, datasets=mapped, generate=False, unload=True, resampler="nearest")
-        nc_name = f"{area_name}.nc"
-        output_path = Path(task.output_dir) / nc_name
+        ts = sr.start_time.strftime("%Y%m%dT%H%M%S")
+        filename = f"{ts}_{sr.product_id}_{mapped[0]}_{grid.name}_{grid.dist}km.nc"
+        output_path = Path(task.output_dir) / filename
         result = resampled.save_dataset(
             dataset_id=mapped[0],
             writer="cf",
