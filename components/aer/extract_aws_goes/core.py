@@ -107,7 +107,7 @@ def extract_aws_goes(task: ExtractionTask, **kwargs) -> ExtractionTask:
 
         resampled = scene.resample(area_def, datasets=mapped, generate=False, unload=True, resampler="nearest")
         nc_name = f"{area_name}.nc"
-        output_path = task.output_dir / nc_name
+        output_path = Path(task.output_dir) / nc_name
         result = resampled.save_dataset(
             dataset_id=mapped[0],
             writer="cf",
