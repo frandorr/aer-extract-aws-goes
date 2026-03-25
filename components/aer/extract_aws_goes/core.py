@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import gc
 from pathlib import Path
 
 import attrs
@@ -110,11 +111,15 @@ def extract_aws_goes(task: ExtractionTask, **kwargs) -> ExtractionTask:
         ts = sr.start_time.strftime("%Y%m%dT%H%M%S")
         filename = f"{ts}_{sr.product_id}_{mapped[0]}_{grid.name}_{grid.dist}km.nc"
         output_path = Path(task.output_dir) / filename
-        result = resampled.save_dataset(
+        resampled.save_dataset(
             dataset_id=mapped[0],
             writer="cf",
             filename=str(output_path),
         )
+
+        # Free memory
+        del resampled, scene, gdf, downloaded
+        gc.collect()
 
         logger.info("extract_success", area_name=area_name, channel=channel.c_id)
         return attrs.evolve(task, status=ExtractionStatus.SUCCESS)
