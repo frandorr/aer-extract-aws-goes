@@ -1,27 +1,21 @@
+from __future__ import annotations
+
 import re
 from pathlib import Path
-from typing import Any
 
-import pandas as pd
+import attrs
 import satpy
-from structlog import get_logger
-
-from aer.download_api import download
-from aer.extract.core import ExtractedResultSchema
-from aer.plugin import plugin
-from aer.search import SearchResultSchema
-from aer.settings.core import ENV_SETTINGS
-from pandera.typing.geopandas import GeoDataFrame
 from satpy.writers.core.compute import compute_writer_results
+from aer.extract import ExtractionTask
+from aer.extract.core import ExtractionStatus
+from aer.download_api import download
+from structlog import get_logger
 
 logger = get_logger()
 
 L1B_PATTERN = re.compile(r"ABI-L1b-Rad[CF]")
 L2_AOD_PATTERN = re.compile(r"ABI-L2-AOD[CF]")
 L2_BRF_PATTERN = re.compile(r"ABI-L2-BRF[CF]")
-
-# Confirm that satpy config is correctly set
-satpy.config.set(config_path=[ENV_SETTINGS.SATPY_CONFIG_PATH])
 
 
 def detect_reader(filename: str) -> str | None:
@@ -35,208 +29,92 @@ def detect_reader(filename: str) -> str | None:
     return None
 
 
-def group_files_by_reader(files: list[Path]) -> dict[str, list[Path]]:
-    """Group GOES files by their applicable satpy reader."""
-    grouped: dict[str, list[Path]] = {}
-    for f in files:
-        reader = detect_reader(f.name)
-        if reader:
-            grouped.setdefault(reader, []).append(f)
-        else:
-            logger.warning("unknown_goes_file", filename=f.name)
-    return grouped
+def map_channel_ids_to_satpy_names(channel_ids: set[str], available_names: set[str]) -> list[str]:
+    """Map channel IDs to satpy dataset names.
 
-
-def map_channel_ids_to_satpy_names(
-    channel_ids: set[str], available_names: set[str]
-) -> list[str]:
-    """Map aer Channel c_ids to satpy dataset names.
-
-    The search plugin stores c_id as e.g. "1" (stripped int), while satpy
-    uses "C01" for ABI L1b.  This function tries direct match first, then
-    zero-padded "C{id}" format.
-
-    Args:
-        channel_ids: Set of c_id strings from the GDF channels column.
-        available_names: Set from ``scene.available_dataset_names()``.
-
-    Returns:
-        List of satpy dataset names that matched.
+    Handles direct matches ('C01' in available) and numeric IDs
+    ('1' -> 'C01', '13' -> 'C13').
     """
-    matched: list[str] = []
-    for c_id in channel_ids:
-        if c_id in available_names:
-            matched.append(c_id)
-        else:
-            # Try "C01" format: zero-pad the numeric id
-            padded = f"C{c_id.zfill(2)}"
+    result: list[str] = []
+    for cid in channel_ids:
+        if cid in available_names:
+            result.append(cid)
+        elif cid.isdigit():
+            padded = f"C{int(cid):02d}"
             if padded in available_names:
-                matched.append(padded)
-    return matched
+                result.append(padded)
+    return result
 
 
-def harmonize_reflectance(scene: satpy.Scene) -> satpy.Scene:
-    """Harmonize reflectance and set calibration units if necessary."""
-    # Placeholder for actual harmonization from the reference script.
-    return scene
+def extract_aws_goes(task: ExtractionTask) -> ExtractionTask:
+    """Extract GOES satellite data from AWS using satpy.
 
-
-@plugin(name="aws_goes", category="extract")
-def extract_aws_goes(
-    search_result: GeoDataFrame[SearchResultSchema],
-    dest_dir: Path | str,
-    resolution: float = 2000.0,
-    **options: Any,
-) -> GeoDataFrame[ExtractedResultSchema]:
-    """Extract AWS GOES data for the given search results using Satpy.
-
-    Processes EACH row of the search result individually, using the row-specific
-    ``channels`` and ``overlapping_spatial_extent``.
+    Downloads the file from the search result, creates a satpy Scene,
+    maps the channel, resamples to the grid cell area definition,
+    and saves as GeoTIFF.
 
     Args:
-        search_result: The search results to download and extract.
-        dest_dir: Base directory where local files and extracted output will be saved.
-        resolution: Target resolution for extraction (default 2000.0).
-        **options: Additional options.
+        task: Extraction task with search result and output directory.
 
     Returns:
-        A GeoDataFrame conforming to ExtractedResultSchema.
+        The task with status updated to SUCCESS or FAILED.
     """
-    dest_path = Path(dest_dir)
+    sr = task.search_result
+    granule_id = sr.granule_id
+    channel = sr.channel
+    grid = sr.grid
 
-    # 1. Download
-    downloaded = download(gdf=search_result, dest_dir=dest_path)
+    reader = detect_reader(granule_id)
+    if reader is None:
+        logger.error("extract_failed", reason=f"Cannot detect reader from {granule_id}")
+        return attrs.evolve(task, status=ExtractionStatus.FAILED)
 
-    # Filter only successfully downloaded files
-    valid = downloaded[downloaded["download_status"] == "complete"].copy()
-    if valid.empty:
-        logger.warning("no_files_downloaded")
-        valid["reprojected_path"] = pd.Series(dtype=str)
-        valid["resolution"] = pd.Series(dtype=float)
-        return valid  # type: ignore
+    if channel is None:
+        logger.error("extract_failed", reason="SearchResult has no channel")
+        return attrs.evolve(task, status=ExtractionStatus.FAILED)
 
-    # 2. Extract using satpy row-by-row
-    output_rows: list[Any] = []
-    to_be_computed: list[Any] = []
-    output_format = options.get("output_format", "nc")
-    res_int = int(resolution)
+    if grid is None:
+        logger.error("extract_failed", reason="SearchResult has no grid")
+        return attrs.evolve(task, status=ExtractionStatus.FAILED)
 
-    for _, row in valid.iterrows():
-        local_path = Path(row["local_path"])
-        reader = detect_reader(local_path.name)
-        if not reader:
-            continue
+    try:
+        # Reconstruct a single-row gdf for the download function
+        from aer.search import SearchResult as SR
 
-        try:
-            # Create scene for this specific file
-            scene = satpy.Scene(filenames=[str(local_path)], reader=reader)
-            available = set(scene.available_dataset_names())
+        gdf = SR.to_gdf([sr])
+        downloaded = download(gdf, task.output_dir)
+        local_path = Path(downloaded.iloc[0]["local_path"])
 
-            # Row-specific channel selection
-            row_channel_ids = set()
-            if "channels" in valid.columns and row["channels"]:
-                for ch in row["channels"]:
-                    if hasattr(ch, "c_id"):
-                        row_channel_ids.add(ch.c_id)
+        # Build satpy scene
+        scene = satpy.Scene(reader=reader, filenames=[str(local_path)])
 
-            if row_channel_ids:
-                bands_to_load = map_channel_ids_to_satpy_names(
-                    row_channel_ids, available
-                )
-            else:
-                bands_to_load = list(available)
+        # Map channel c_id to satpy name
+        available = set(scene.available_dataset_names())
+        mapped = map_channel_ids_to_satpy_names({channel.c_id}, available)
 
-            if not bands_to_load:
-                logger.warning(
-                    "no_matching_bands",
-                    filename=local_path.name,
-                    requested=row_channel_ids,
-                    available=available,
-                )
-                continue
+        if not mapped:
+            logger.error("extract_failed", reason=f"Channel {channel.c_id} not found in available: {available}")
+            return attrs.evolve(task, status=ExtractionStatus.FAILED)
 
-            scene.load(bands_to_load)
-            scene = harmonize_reflectance(scene)
+        # Load, resample, save
+        scene.load(mapped)
+        grid_cell = grid.grid_cell
+        area_def = grid_cell.area_def(channel.resolution)
+        area_name = grid_cell.area_name(channel.resolution)
 
-            # Row-specific grid cells
-            spatial_ext = row["overlapping_spatial_extent"]
-            grid_cells = (
-                spatial_ext.grid_cells
-                if spatial_ext is not None and hasattr(spatial_ext, "grid_cells")
-                else []
-            )
+        resampled = scene.resample(area_def, datasets=mapped)
+        tif_name = f"{area_name}.tif"
+        result = resampled.save_datasets(
+            writer="geotiff",
+            base_dir=str(task.output_dir),
+            filename=tif_name,
+            compute=False,
+        )
+        compute_writer_results(result)
 
-            # Cleanup granule_id by removing common extensions (.nc)
-            granule_id = str(row["granule_id"])
-            if granule_id.endswith(".nc"):
-                granule_id = granule_id[:-3]
+        logger.info("extract_success", area_name=area_name, channel=channel.c_id)
+        return attrs.evolve(task, status=ExtractionStatus.SUCCESS)
 
-            if grid_cells:
-                for grid_cell in grid_cells:
-                    area_def = grid_cell.area_def(res_int)
-                    resampled_scn = scene.resample(
-                        destination=area_def,
-                        datasets=bands_to_load,
-                        resampler="nearest",
-                    )
-
-                    cell_id = grid_cell.area_name(res_int)
-                    out_file = (
-                        dest_path / f"extracted_{granule_id}_{cell_id}.{output_format}"
-                    )
-
-                    if output_format in ("nc", "netcdf"):
-                        delayed = resampled_scn.save_datasets(
-                            filename=str(out_file), writer="cf", compute=False
-                        )
-                    else:
-                        delayed = resampled_scn.save_datasets(
-                            filename=str(out_file), writer="geotiff", compute=False
-                        )
-
-                    if delayed:
-                        to_be_computed.extend(delayed)
-
-                    rep_row = row.copy()
-                    rep_row["reprojected_path"] = str(out_file)
-                    rep_row["resolution"] = float(resolution)
-                    output_rows.append(rep_row)
-
-                    del resampled_scn
-            else:
-                # No spatial extent — save raw scene
-                out_file = dest_path / f"extracted_{granule_id}.{output_format}"
-                if output_format in ("nc", "netcdf"):
-                    delayed = scene.save_datasets(
-                        filename=str(out_file), writer="cf", compute=False
-                    )
-                else:
-                    delayed = scene.save_datasets(
-                        filename=str(out_file), writer="geotiff", compute=False
-                    )
-                if delayed:
-                    to_be_computed.extend(delayed)
-
-                rep_row = row.copy()
-                rep_row["reprojected_path"] = str(out_file)
-                rep_row["resolution"] = float(resolution)
-                output_rows.append(rep_row)
-
-            del scene
-
-        except Exception as exc:
-            logger.error("extraction_failed", filename=local_path.name, error=str(exc))
-
-    # Batch-compute all deferred writes
-    if to_be_computed:
-        compute_writer_results(to_be_computed)
-
-    if not output_rows:
-        valid["reprojected_path"] = pd.Series(dtype=str)
-        valid["resolution"] = pd.Series(dtype=float)
-        return valid  # type: ignore
-
-    result_df = pd.DataFrame(output_rows)
-    from geopandas import GeoDataFrame as gpd_GeoDataFrame
-
-    return gpd_GeoDataFrame(result_df, geometry="geometry", crs=search_result.crs)
+    except Exception as exc:
+        logger.error("extract_failed", reason=str(exc))
+        return attrs.evolve(task, status=ExtractionStatus.FAILED)
