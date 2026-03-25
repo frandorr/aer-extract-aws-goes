@@ -5,7 +5,6 @@ from pathlib import Path
 
 import attrs
 import satpy
-from satpy.writers.core.compute import compute_writer_results
 from aer.extract import ExtractionTask
 from aer.extract.core import ExtractionStatus
 from aer.download_api import download
@@ -104,14 +103,12 @@ def extract_aws_goes(task: ExtractionTask) -> ExtractionTask:
         area_name = grid_cell.area_name(channel.resolution)
 
         resampled = scene.resample(area_def, datasets=mapped, generate=False, unload=True, resampler="nearest")
-        tif_name = f"{area_name}.tif"
-        result = resampled.save_datasets(
-            writer="geotiff",
-            base_dir=str(task.output_dir),
-            filename=tif_name,
-            compute=False,
+        nc_name = f"{area_name}.nc"
+        result = resampled.save_dataset(
+            dataset_id=mapped[0],
+            writer="cf",
+            filename=nc_name,
         )
-        compute_writer_results(result)
 
         logger.info("extract_success", area_name=area_name, channel=channel.c_id)
         return attrs.evolve(task, status=ExtractionStatus.SUCCESS)

@@ -55,7 +55,7 @@ requires-dist = [
 
 [[package]]
 name = "aer-extract-aws-goes"
-version = "0.1.0"
+version = "1.0.0"
 source = { editable = "projects/aer-extract-aws-goes" }
 dependencies = [
     { name = "aer-core" },
