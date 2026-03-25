@@ -10,6 +10,7 @@ from aer.extract import ExtractionTask
 from aer.extract.core import ExtractionStatus
 from aer.download_api import download
 from structlog import get_logger
+from aer.plugin import plugin
 
 logger = get_logger()
 
@@ -45,7 +46,7 @@ def map_channel_ids_to_satpy_names(channel_ids: set[str], available_names: set[s
                 result.append(padded)
     return result
 
-
+@plugin("aws_goes", "extract")
 def extract_aws_goes(task: ExtractionTask) -> ExtractionTask:
     """Extract GOES satellite data from AWS using satpy.
 
