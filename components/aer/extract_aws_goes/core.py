@@ -3,7 +3,9 @@ from __future__ import annotations
 import re
 import gc
 from pathlib import Path
+from typing import Any
 
+import numpy as np
 import attrs
 import satpy
 from aer.extract import ExtractionTask
@@ -45,6 +47,87 @@ def map_channel_ids_to_satpy_names(channel_ids: set[str], available_names: set[s
             if padded in available_names:
                 result.append(padded)
     return result
+
+
+def extract_resample_lut(
+    source_area: Any,
+    target_area: Any,
+    radius_of_influence: float | None = None,
+) -> dict[str, Any]:
+    """Compute a nearest-neighbor resampling lookup table.
+
+    Args:
+        source_area: pyresample AreaDefinition for the source grid.
+        target_area: pyresample AreaDefinition for the target grid.
+        radius_of_influence: Search radius in meters. None lets pyresample
+            compute a sensible default.
+
+    Returns:
+        Dict with keys: index_array, valid_input_index, valid_output_index,
+        distance_array, source_shape, target_shape.
+    """
+    from pyresample.kd_tree import XArrayResamplerNN
+
+    kwargs: dict[str, Any] = {"neighbours": 1}
+    if radius_of_influence is not None:
+        kwargs["radius_of_influence"] = radius_of_influence
+
+    resampler = XArrayResamplerNN(source_area, target_area, **kwargs)
+    valid_input_index, valid_output_index, index_array, distance_array = resampler.get_neighbour_info()
+
+    # Convert dask arrays to numpy if needed
+    def _to_numpy(arr: Any) -> np.ndarray:
+        if hasattr(arr, "compute"):
+            return np.asarray(arr.compute())
+        return np.asarray(arr)
+
+    return {
+        "index_array": _to_numpy(index_array),
+        "valid_input_index": _to_numpy(valid_input_index),
+        "valid_output_index": _to_numpy(valid_output_index),
+        "distance_array": _to_numpy(distance_array),
+        "source_shape": source_area.shape,
+        "target_shape": target_area.shape,
+    }
+
+
+def apply_resample_lut(
+    lut: dict[str, Any],
+    source_data: np.ndarray,
+    fill_value: float = np.nan,
+) -> np.ndarray:
+    """Apply a precomputed resampling LUT to source data.
+
+    Args:
+        lut: Dict returned by extract_resample_lut.
+        source_data: 2D array with shape matching lut['source_shape'].
+        fill_value: Value for pixels with no valid source neighbor.
+
+    Returns:
+        2D numpy array with shape lut['target_shape'].
+    """
+    index_array = lut["index_array"]
+    valid_input_index = lut["valid_input_index"]
+    target_shape = lut["target_shape"]
+
+    # Flatten source data
+    source_flat = source_data.ravel()
+
+    # For nearest-neighbor with neighbours=1, index_array is (target_rows, target_cols, 1)
+    index_2d = index_array[:, :, 0]
+
+    # Create output filled with fill_value
+    output = np.full(target_shape, fill_value, dtype=np.float64)
+
+    # Valid mask: index >= 0 means a neighbor was found
+    valid_mask = index_2d >= 0
+
+    # Map through valid_input_index to get actual source flat indices
+    valid_indices = index_2d[valid_mask]
+    actual_source_indices = valid_input_index[valid_indices]
+
+    output[valid_mask] = source_flat[actual_source_indices]
+    return output
 
 
 @plugin("aws_goes", "extract")
