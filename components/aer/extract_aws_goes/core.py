@@ -3,14 +3,17 @@ from __future__ import annotations
 import re
 import gc
 from pathlib import Path
-from typing import Any
+from collections import defaultdict
 
+import threading
 import cloudpickle
 import numpy as np
 import xarray as xr
 import attrs
 import satpy
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from aer.extract import ExtractionTask
+from aer.search import SearchResult
 from aer.extract.core import ExtractionStatus
 from aer.download_api import download
 from pyresample.kd_tree import get_neighbour_info, get_sample_from_neighbour_info
@@ -241,6 +244,21 @@ def get_or_build_lut(
     return build_and_save_lut(scene, area_def, area_name, lut_key_str, lut_cache_dir, dataset_name)
 
 
+
+def group_results(results):
+    grouped = defaultdict(list)
+
+    for r in results:
+        key = (r.granule_id, r.channel)  
+        # or directly r.channel if it's hashable
+
+        grouped[key].append(r)  # or r.grid.name if you only want ids
+
+    return grouped
+
+
+LUT_LOCK = threading.Lock()
+
 @plugin("aws_goes", "extract")
 def extract_aws_goes(task: ExtractionTask, **kwargs) -> ExtractionTask:
     """Extract GOES satellite data from AWS using satpy.
@@ -255,34 +273,31 @@ def extract_aws_goes(task: ExtractionTask, **kwargs) -> ExtractionTask:
     Returns:
         The task with status updated to SUCCESS or FAILED.
     """
-    sr = task.search_result
-    granule_id = sr.granule_id
-    channel = sr.channel
-    grid = sr.grid
+    # 1. Group search results by granule_id and channel and get all grid_cells for each group as a list
+    grouped_search_results = group_results(task.search_results)
 
-    reader = detect_reader(granule_id)
-    if reader is None:
-        logger.error("extract_failed", reason=f"Cannot detect reader from {granule_id}")
-        return attrs.evolve(task, status=ExtractionStatus.FAILED)
+    for (granule_id, channel), search_results in grouped_search_results.items():
+        reader = detect_reader(granule_id)
+        if reader is None:
+            logger.error("extract_failed", reason=f"Cannot detect reader from {granule_id}")
+            return attrs.evolve(task, status=ExtractionStatus.FAILED)
 
-    if channel is None:
-        logger.error("extract_failed", reason="SearchResult has no channel")
-        return attrs.evolve(task, status=ExtractionStatus.FAILED)
+        if channel is None:
+            logger.error("extract_failed", reason="SearchResult has no channel")
+            return attrs.evolve(task, status=ExtractionStatus.FAILED)
 
-    if grid is None:
-        logger.error("extract_failed", reason="SearchResult has no grid")
-        return attrs.evolve(task, status=ExtractionStatus.FAILED)
 
-    try:
         # Reconstruct a single-row gdf for the download function
         from aer.search import SearchResult as SR
 
-        gdf = SR.to_gdf([sr])
+        gdf = SR.to_gdf(search_results)
+        first_sr = search_results[0]
         downloaded = download(gdf, task.output_dir)
         local_path = Path(downloaded.iloc[0]["local_path"])
 
         # Build satpy scene
         scene = satpy.Scene(reader=reader, filenames=[str(local_path)])
+        scene_cp = scene.copy()
 
         # Map channel c_id to satpy name
         available = set(scene.available_dataset_names())
@@ -297,52 +312,71 @@ def extract_aws_goes(task: ExtractionTask, **kwargs) -> ExtractionTask:
             scene.load(mapped, modifiers=modifiers)
         else:
             scene.load(mapped)
-        grid_cell = grid.grid_cell
-        area_def = grid_cell.area_def(channel.resolution)
-        area_name = grid_cell.area_name(channel.resolution)
-
-        # Parse granule ID for LUT key
-        satellite, scan_type = _parse_granule_id(granule_id)
-        lut_key_str = _lut_key(satellite, scan_type, area_name)
-
-        # LUT cache directory
-        lut_cache_dir = Path(task.output_dir) / "luts"
-        lut_cache_dir.mkdir(parents=True, exist_ok=True)
-
-        # LUT-based resampling (fast, cached)
-        valid_input_index, valid_output_index, index_array, target_shape, template = get_or_build_lut(
-            scene, area_def, area_name, lut_key_str, lut_cache_dir, mapped[0]
-        )
-
         source_data = np.asarray(scene[mapped[0]].data)
         if hasattr(source_data, "compute"):
             source_data = source_data.compute()
 
-        resampled_data = apply_lookup_table(
-            source_data, valid_input_index, valid_output_index, index_array, target_shape
-        )
+        # Parse granule ID for satellite/scan info
+        satellite, scan_type = _parse_granule_id(granule_id)
+        # LUT cache directory
+        lut_cache_dir = Path(task.output_dir) / "luts"
+        lut_cache_dir.mkdir(parents=True, exist_ok=True)
 
-        # Wrap in xarray DataArray for save_dataset compatibility
-        resampled_da = xr.DataArray(
-            resampled_data.reshape(target_shape),
-            coords=template["coords"],
-            dims=template["dims"],
-            attrs=template["attrs"],
-            name=template["name"],
-        )
+        def _process_single_result(sr: SearchResult) -> bool:
+            try:
+                grid_cell = sr.grid_cell
+                area_def = grid_cell.area_def(channel.resolution)
+                area_name = grid_cell.area_name(channel.resolution)
+                ts = first_sr.start_time.strftime("%Y%m%dT%H%M%S")
+                filename = f"{ts}_{first_sr.product_id}_{mapped[0]}_{area_name}.nc"
+                output_path = Path(task.output_dir) / filename
 
-        ts = sr.start_time.strftime("%Y%m%dT%H%M%S")
-        filename = f"{ts}_{sr.product_id}_{mapped[0]}_{grid.name}_{grid.dist}km.nc"
-        output_path = Path(task.output_dir) / filename
-        xr.Dataset({mapped[0]: resampled_da}).to_netcdf(str(output_path))
+                # check if output file already exists
+                if output_path.exists():
+                    return True
 
-        # Free memory
-        del resampled_da, scene, gdf, downloaded
-        gc.collect()
+                lut_key_str = _lut_key(satellite, scan_type, area_name)
 
-        logger.info("extract_success", area_name=area_name, channel=channel.c_id)
+                # LUT-based resampling (fast, cached). Lock to avoid simultaneous build/write.
+                with LUT_LOCK:
+                    valid_input_index, valid_output_index, index_array, target_shape, template = get_or_build_lut(
+                        scene, area_def, area_name, lut_key_str, lut_cache_dir, mapped[0]
+                    )
+
+                resampled_data = apply_lookup_table(
+                    source_data, valid_input_index, valid_output_index, index_array, target_shape
+                )
+
+                # Wrap in xarray DataArray for save_dataset compatibility
+                resampled_da = xr.DataArray(
+                    resampled_data.reshape(target_shape),
+                    coords=template["coords"],
+                    dims=template["dims"],
+                    attrs=template["attrs"],
+                    name=template["name"],
+                )
+
+                # Use a local scene copy to ensure thread-safe saving
+                local_scene = scene_cp.copy()
+                local_scene[mapped[0]] = resampled_da
+                local_scene.save_dataset(dataset_id=mapped[0], filename=str(output_path))
+
+                # Free memory
+                del resampled_da
+                gc.collect()
+                return True
+
+            except Exception as exc:
+                logger.error("extract_failed", reason=str(exc), area_name=sr.grid_cell.area_name(channel.resolution))
+                return False
+
+        # Run extraction in parallel
+        # Note: ThreadPoolExecutor is used because resampling/saving involves I/O and GIL-releasing operations.
+        max_workers = kwargs.get("max_workers", 8)
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [executor.submit(_process_single_result, sr) for sr in search_results]
+            for future in as_completed(futures):
+                if not future.result():
+                    return attrs.evolve(task, status=ExtractionStatus.FAILED)
+        logger.info("extract_success", channel=channel.c_id, granule_id=granule_id)
         return attrs.evolve(task, status=ExtractionStatus.SUCCESS)
-
-    except Exception as exc:
-        logger.error("extract_failed", reason=str(exc))
-        return attrs.evolve(task, status=ExtractionStatus.FAILED)
