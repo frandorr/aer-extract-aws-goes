@@ -5,12 +5,15 @@ import gc
 from pathlib import Path
 from typing import Any
 
+import cloudpickle
 import numpy as np
+import xarray as xr
 import attrs
 import satpy
 from aer.extract import ExtractionTask
 from aer.extract.core import ExtractionStatus
 from aer.download_api import download
+from pyresample.kd_tree import get_neighbour_info, get_sample_from_neighbour_info
 from structlog import get_logger
 from aer.plugin import plugin
 
@@ -49,85 +52,193 @@ def map_channel_ids_to_satpy_names(channel_ids: set[str], available_names: set[s
     return result
 
 
-def extract_resample_lut(
-    source_area: Any,
-    target_area: Any,
-    radius_of_influence: float | None = None,
-) -> dict[str, Any]:
-    """Compute a nearest-neighbor resampling lookup table.
+def _parse_granule_id(granule_id: str) -> tuple[str, str]:
+    """Extract satellite and scan type from a GOES granule ID.
 
-    Args:
-        source_area: pyresample AreaDefinition for the source grid.
-        target_area: pyresample AreaDefinition for the target grid.
-        radius_of_influence: Search radius in meters. None lets pyresample
-            compute a sensible default.
-
-    Returns:
-        Dict with keys: index_array, valid_input_index, valid_output_index,
-        distance_array, source_shape, target_shape.
+    Examples
+    --------
+    >>> _parse_granule_id("ABI-L1b-RadF-M6C01_G19_s20260331200204_e20260331209512_c20260331209563.nc")
+    ('G19', 'FD')
+    >>> _parse_granule_id("ABI-L1b-RadC-M6C01_G16_s20260331200204_e20260331209512_c20260331209563.nc")
+    ('G16', 'Conus')
     """
-    from pyresample.kd_tree import XArrayResamplerNN
+    sat_match = re.search(r"_(G\d+)_", granule_id)
+    scan_match = re.search(r"Rad([CF])", granule_id)
+    satellite = sat_match.group(1) if sat_match else "unknown"
+    scan_char = scan_match.group(1) if scan_match else "?"
+    scan_type = "FD" if scan_char == "F" else "Conus"
+    return satellite, scan_type
 
-    kwargs: dict[str, Any] = {"neighbours": 1}
-    if radius_of_influence is not None:
-        kwargs["radius_of_influence"] = radius_of_influence
 
-    resampler = XArrayResamplerNN(source_area, target_area, **kwargs)
-    valid_input_index, valid_output_index, index_array, distance_array = resampler.get_neighbour_info()
+def _lut_key(satellite: str, scan_type: str, area_name: str) -> str:
+    """Build a LUT cache key from satellite, scan type, and area name."""
+    return f"{satellite}_{scan_type}_{area_name}"
 
-    # Convert dask arrays to numpy if needed
-    def _to_numpy(arr: Any) -> np.ndarray:
-        if hasattr(arr, "compute"):
-            return np.asarray(arr.compute())
-        return np.asarray(arr)
 
-    return {
-        "index_array": _to_numpy(index_array),
-        "valid_input_index": _to_numpy(valid_input_index),
-        "valid_output_index": _to_numpy(valid_output_index),
-        "distance_array": _to_numpy(distance_array),
-        "source_shape": source_area.shape,
-        "target_shape": target_area.shape,
+def save_lookup_table(
+    filename: str,
+    valid_input_index: np.ndarray,
+    valid_output_index: np.ndarray,
+    index_array: np.ndarray,
+    shape: tuple[int, int],
+) -> None:
+    """Save a lookup table to a compressed npz file.
+
+    Uses np.packbits for boolean arrays and np.savez_compressed for
+    efficient storage.
+    """
+    packed_input = np.packbits(valid_input_index)
+    packed_output = np.packbits(valid_output_index)
+
+    np.savez_compressed(
+        filename,
+        valid_input_index=packed_input,
+        valid_output_index=packed_output,
+        index_array=index_array.astype(np.int32),
+        valid_input_length=len(valid_input_index),
+        valid_output_length=len(valid_output_index),
+        shape=np.array(shape),
+    )
+
+
+def load_lookup_table(
+    filename: str,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, tuple[int, int]]:
+    """Load a lookup table from a compressed npz file.
+
+    Returns (valid_input_index, valid_output_index, index_array, shape).
+    """
+    npz = np.load(filename)
+    valid_input_index = np.unpackbits(npz["valid_input_index"])[: int(npz["valid_input_length"])]
+    valid_output_index = np.unpackbits(npz["valid_output_index"])[: int(npz["valid_output_length"])]
+    index_array = npz["index_array"]
+    shape = tuple(npz["shape"])
+
+    return (
+        valid_input_index.astype(bool),
+        valid_output_index.astype(bool),
+        index_array,
+        shape,
+    )
+
+
+def apply_lookup_table(
+    source_arr: np.ndarray,
+    valid_input_index: np.ndarray,
+    valid_output_index: np.ndarray,
+    index_array: np.ndarray,
+    target_shape: tuple[int, int],
+) -> np.ndarray:
+    """Apply a lookup table for fast nearest-neighbour resampling.
+
+    Uses pyresample's get_sample_from_neighbour_info.
+    """
+    res = get_sample_from_neighbour_info(
+        "nn",
+        target_shape,
+        source_arr,
+        valid_input_index,
+        valid_output_index,
+        index_array,
+        fill_value=np.nan,
+    )
+    return res
+
+
+def build_and_save_lut(
+    scene: satpy.Scene,
+    area_def,
+    area_name: str,
+    lut_key_str: str,
+    lut_cache_dir: Path,
+    dataset_name: str,
+) -> tuple:
+    """Build a resampling LUT from scene and area definition, save to disk.
+
+    Returns (valid_input_index, valid_output_index, index_array,
+             target_shape, template).
+    """
+    source_geo_def = scene[dataset_name].attrs["area"]
+
+    # Compute neighbour info
+    valid_input_index, valid_output_index, index_array, _ = get_neighbour_info(
+        source_geo_def,
+        area_def,
+        radius_of_influence=10000,
+        neighbours=1,
+        nprocs=-1,
+    )
+
+    target_shape = (area_def.height, area_def.width)
+
+    # Save LUT
+    lut_path = lut_cache_dir / f"lut_{lut_key_str}.npz"
+    save_lookup_table(
+        str(lut_path),
+        valid_input_index,
+        valid_output_index,
+        index_array,
+        target_shape,
+    )
+
+    # Build and save template via resample once
+    resampled_scene = scene.resample(
+        area_def,
+        datasets=[dataset_name],
+        generate=False,
+        unload=True,
+        resampler="nearest",
+    )
+    da_template = resampled_scene[dataset_name]
+    template = {
+        "coords": {k: v.values for k, v in da_template.coords.items()},
+        "dims": da_template.dims,
+        "attrs": dict(da_template.attrs),
+        "name": da_template.name,
     }
 
+    template_path = lut_cache_dir / f"template_{lut_key_str}.pkl"
+    with open(template_path, "wb") as f:
+        cloudpickle.dump(template, f)
 
-def apply_resample_lut(
-    lut: dict[str, Any],
-    source_data: np.ndarray,
-    fill_value: float = np.nan,
-) -> np.ndarray:
-    """Apply a precomputed resampling LUT to source data.
+    return valid_input_index, valid_output_index, index_array, target_shape, template
 
-    Args:
-        lut: Dict returned by extract_resample_lut.
-        source_data: 2D array with shape matching lut['source_shape'].
-        fill_value: Value for pixels with no valid source neighbor.
 
-    Returns:
-        2D numpy array with shape lut['target_shape'].
+def load_lut(lut_key_str: str, lut_cache_dir: Path) -> tuple:
+    """Load a cached LUT and template from disk.
+
+    Returns (valid_input_index, valid_output_index, index_array,
+             target_shape, template).
     """
-    index_array = lut["index_array"]
-    valid_input_index = lut["valid_input_index"]
-    target_shape = lut["target_shape"]
+    lut_path = lut_cache_dir / f"lut_{lut_key_str}.npz"
+    valid_input_index, valid_output_index, index_array, shape = load_lookup_table(str(lut_path))
 
-    # Flatten source data
-    source_flat = source_data.ravel()
+    template_path = lut_cache_dir / f"template_{lut_key_str}.pkl"
+    with open(template_path, "rb") as f:
+        template = cloudpickle.load(f)
 
-    # For nearest-neighbor with neighbours=1, index_array is (target_rows, target_cols, 1)
-    index_2d = index_array[:, :, 0]
+    return valid_input_index, valid_output_index, index_array, shape, template
 
-    # Create output filled with fill_value
-    output = np.full(target_shape, fill_value, dtype=np.float64)
 
-    # Valid mask: index >= 0 means a neighbor was found
-    valid_mask = index_2d >= 0
+def get_or_build_lut(
+    scene: satpy.Scene,
+    area_def,
+    area_name: str,
+    lut_key_str: str,
+    lut_cache_dir: Path,
+    dataset_name: str,
+) -> tuple:
+    """Return LUT data, building only if not cached on disk.
 
-    # Map through valid_input_index to get actual source flat indices
-    valid_indices = index_2d[valid_mask]
-    actual_source_indices = valid_input_index[valid_indices]
-
-    output[valid_mask] = source_flat[actual_source_indices]
-    return output
+    Returns (valid_input_index, valid_output_index, index_array,
+             target_shape, template).
+    """
+    lut_path = lut_cache_dir / f"lut_{lut_key_str}.npz"
+    if lut_path.exists():
+        logger.info("lut_cache_hit", lut_key=lut_key_str)
+        return load_lut(lut_key_str, lut_cache_dir)
+    logger.info("lut_cache_miss", lut_key=lut_key_str)
+    return build_and_save_lut(scene, area_def, area_name, lut_key_str, lut_cache_dir, dataset_name)
 
 
 @plugin("aws_goes", "extract")
