@@ -301,18 +301,43 @@ def extract_aws_goes(task: ExtractionTask, **kwargs) -> ExtractionTask:
         area_def = grid_cell.area_def(channel.resolution)
         area_name = grid_cell.area_name(channel.resolution)
 
-        resampled = scene.resample(area_def, datasets=mapped, generate=False, unload=True, resampler="nearest")
+        # Parse granule ID for LUT key
+        satellite, scan_type = _parse_granule_id(granule_id)
+        lut_key_str = _lut_key(satellite, scan_type, area_name)
+
+        # LUT cache directory
+        lut_cache_dir = Path(task.output_dir) / "luts"
+        lut_cache_dir.mkdir(parents=True, exist_ok=True)
+
+        # LUT-based resampling (fast, cached)
+        valid_input_index, valid_output_index, index_array, target_shape, template = get_or_build_lut(
+            scene, area_def, area_name, lut_key_str, lut_cache_dir, mapped[0]
+        )
+
+        source_data = np.asarray(scene[mapped[0]].data)
+        if hasattr(source_data, "compute"):
+            source_data = source_data.compute()
+
+        resampled_data = apply_lookup_table(
+            source_data, valid_input_index, valid_output_index, index_array, target_shape
+        )
+
+        # Wrap in xarray DataArray for save_dataset compatibility
+        resampled_da = xr.DataArray(
+            resampled_data.reshape(target_shape),
+            coords=template["coords"],
+            dims=template["dims"],
+            attrs=template["attrs"],
+            name=template["name"],
+        )
+
         ts = sr.start_time.strftime("%Y%m%dT%H%M%S")
         filename = f"{ts}_{sr.product_id}_{mapped[0]}_{grid.name}_{grid.dist}km.nc"
         output_path = Path(task.output_dir) / filename
-        resampled.save_dataset(
-            dataset_id=mapped[0],
-            writer="cf",
-            filename=str(output_path),
-        )
+        xr.Dataset({mapped[0]: resampled_da}).to_netcdf(str(output_path))
 
         # Free memory
-        del resampled, scene, gdf, downloaded
+        del resampled_da, scene, gdf, downloaded
         gc.collect()
 
         logger.info("extract_success", area_name=area_name, channel=channel.c_id)
