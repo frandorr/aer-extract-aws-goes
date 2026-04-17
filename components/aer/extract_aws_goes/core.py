@@ -2,23 +2,25 @@ from __future__ import annotations
 
 import re
 import gc
+import hashlib
 from pathlib import Path
 from collections import defaultdict
+from typing import Any, Sequence, cast, override
 
 import threading
 import cloudpickle
 import numpy as np
+import geopandas as gpd
 import xarray as xr
-import attrs
 import satpy
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from aer.extract import ExtractionTask
-from aer.search import SearchResult
-from aer.extract.core import ExtractionStatus
-from aer.download_api import download
+from aer.interfaces import Extractor, ExtractionTask
+from aer.schemas import ArtifactSchema, AssetSchema, GridSchema
+from aer.grid import GridCell
+from pandera.typing.geopandas import GeoDataFrame
+from shapely.geometry.base import BaseGeometry
 from pyresample.kd_tree import get_neighbour_info, get_sample_from_neighbour_info
 from structlog import get_logger
-from aer.plugin import plugin
 
 logger = get_logger()
 
@@ -244,139 +246,288 @@ def get_or_build_lut(
     return build_and_save_lut(scene, area_def, area_name, lut_key_str, lut_cache_dir, dataset_name)
 
 
-
 def group_results(results):
     grouped = defaultdict(list)
 
     for r in results:
-        key = (r.granule_id, r.channel)  
-        # or directly r.channel if it's hashable
-
-        grouped[key].append(r)  # or r.grid.name if you only want ids
+        key = (r.granule_id, r.channel)
+        grouped[key].append(r)
 
     return grouped
 
 
-LUT_LOCK = threading.Lock()
+_lut_locks: dict[str, threading.Lock] = defaultdict(threading.Lock)
 
-@plugin("aws_goes", "extract")
-def extract_aws_goes(task: ExtractionTask, **kwargs) -> ExtractionTask:
-    """Extract GOES satellite data from AWS using satpy.
+SUPPORTED_COLLECTIONS: Sequence[str] = [
+    "ABI-L1b-RadC",
+    "ABI-L1b-RadF",
+    "ABI-L1b-RadM",
+    "ABI-L2-AODC",
+    "ABI-L2-AODF",
+    "ABI-L2-BRFC",
+    "ABI-L2-BRFF",
+    "ABI-L2-BRFM",
+]
 
-    Downloads the file from the search result, creates a satpy Scene,
-    maps the channel, resamples to the grid cell area definition,
-    and saves as GeoTIFF.
 
-    Args:
-        task: Extraction task with search result and output directory.
+class AwsGoesExtractor(Extractor, plugin_abstract=False):
+    """Extractor plugin for GOES ABI satellite data from AWS.
 
-    Returns:
-        The task with status updated to SUCCESS or FAILED.
+    Downloads NetCDF granules, builds satpy Scenes, resamples to grid cells
+    using LUT-cached nearest-neighbour interpolation, and saves as NetCDF.
     """
-    # 1. Group search results by granule_id and channel and get all grid_cells for each group as a list
-    grouped_search_results = group_results(task.search_results)
 
-    for (granule_id, channel), search_results in grouped_search_results.items():
+    supported_collections: Sequence[str] = SUPPORTED_COLLECTIONS
+
+    @property
+    @override
+    def target_grid_d(self) -> int:
+        """Grid cell size in meters (100 km)."""
+        return 100_000
+
+    @property
+    @override
+    def target_grid_overlap(self) -> bool:
+        return False
+
+    @override
+    def prepare_for_extraction(
+        self,
+        search_results: GeoDataFrame[AssetSchema],
+        target_aoi: BaseGeometry | None = None,
+        resolution: float | None = None,
+        uri: str | None = None,
+        prepare_params: dict[str, Any] | None = None,
+    ) -> Sequence[ExtractionTask]:
+        """Group assets by granule_id so each granule is downloaded once.
+
+        Each ExtractionTask will contain all asset rows sharing the same
+        granule_id. The extract() method will iterate overlapping grid cells
+        internally for each granule.
+        """
+        if resolution is None or uri is None:
+            raise ValueError(
+                "prepare_for_extraction requires resolution and uri. "
+                "Override with custom implementation if you want different behaviour."
+            )
+
+        tasks: list[ExtractionTask] = []
+
+        # Group by granule_id if available, otherwise fall back to one-per-row
+        if "granule_id" in search_results.columns:
+            for _granule_id, group_df in search_results.groupby("granule_id"):
+                task = ExtractionTask(
+                    assets=cast(GeoDataFrame, group_df),
+                    target_grid_d=self.target_grid_d,
+                    target_grid_overlap=self.target_grid_overlap,
+                    resolution=resolution,
+                    uri=uri,
+                    aoi=target_aoi,
+                    task_context={
+                        "prepare_params": prepare_params,
+                        "granule_id": str(_granule_id),
+                    },
+                )
+                tasks.append(task)
+        else:
+            # Fallback: one task per asset row
+            for i in range(len(search_results)):
+                task = ExtractionTask(
+                    assets=search_results.iloc[[i]],
+                    target_grid_d=self.target_grid_d,
+                    target_grid_overlap=self.target_grid_overlap,
+                    resolution=resolution,
+                    uri=uri,
+                    aoi=target_aoi,
+                    task_context={"prepare_params": prepare_params},
+                )
+                tasks.append(task)
+
+        return tasks
+
+    @override
+    def extract(
+        self,
+        extraction_task: ExtractionTask,
+        extract_params: dict[str, Any] | None = None,
+    ) -> GeoDataFrame[ArtifactSchema]:
+        """Extract GOES data for a batch of assets sharing the same granule.
+
+        Downloads the granule once, builds a satpy Scene, then resamples
+        to each overlapping grid cell using LUT-cached nearest-neighbour
+        interpolation. Returns one ArtifactSchema row per grid cell.
+        """
+        extract_params = extract_params or {}
+        assets = extraction_task.assets
+        resolution = extraction_task.resolution
+        uri = extraction_task.uri
+        grid_cells = extraction_task.overlapping_grid_cells
+
+        # All rows in this task share the same granule
+        first_row = assets.iloc[0]
+        href: str = first_row["href"]
+        granule_id: str = first_row.get("granule_id", Path(href).name)
+        channel_id: str | None = first_row.get("channel_id")
+        collection: str = first_row["collection"]
+        start_time = first_row["start_time"]
+        end_time = first_row["end_time"]
+        source_ids = ",".join(assets["id"].astype(str).tolist())
+
         reader = detect_reader(granule_id)
         if reader is None:
-            logger.error("extract_failed", reason=f"Cannot detect reader from {granule_id}")
-            return attrs.evolve(task, status=ExtractionStatus.FAILED)
+            raise ValueError(f"Cannot detect satpy reader from granule: {granule_id}")
 
-        if channel is None:
-            logger.error("extract_failed", reason="SearchResult has no channel")
-            return attrs.evolve(task, status=ExtractionStatus.FAILED)
+        if channel_id is None:
+            raise ValueError(f"No channel_id in asset row for granule: {granule_id}")
 
+        # Download file from S3
+        import s3fs
 
-        # Reconstruct a single-row gdf for the download function
-        from aer.search import SearchResult as SR
-
-        gdf = SR.to_gdf(search_results)
-        first_sr = search_results[0]
-        downloaded = download(gdf, task.output_dir)
-        local_path = Path(downloaded.iloc[0]["local_path"])
+        fs = s3fs.S3FileSystem(anon=True)
+        local_dir = Path(uri)
+        local_dir.mkdir(parents=True, exist_ok=True)
+        local_path = local_dir / Path(href).name
+        if not local_path.exists():
+            s3_path = href.replace("s3://", "")
+            fs.get(s3_path, str(local_path))
+        logger.info("file_downloaded", local_path=str(local_path))
 
         # Build satpy scene
         scene = satpy.Scene(reader=reader, filenames=[str(local_path)])
-        scene_cp = scene.copy()
-
-        # Map channel c_id to satpy name
         available = set(scene.available_dataset_names())
-        mapped = map_channel_ids_to_satpy_names({channel.c_id}, available)
+        mapped = map_channel_ids_to_satpy_names({channel_id}, available)
 
         if not mapped:
-            logger.error("extract_failed", reason=f"Channel {channel.c_id} not found in available: {available}")
-            return attrs.evolve(task, status=ExtractionStatus.FAILED)
+            raise ValueError(f"Channel {channel_id} not found in available datasets: {available}")
 
-        # Load, resample, save
-        if modifiers := kwargs.get("modifiers"):
-            scene.load(mapped, modifiers=modifiers)
+        dataset_name = mapped[0]
+        modifiers = extract_params.get("modifiers")
+        if modifiers is not None:
+            scene.load([dataset_name], modifiers=modifiers)
         else:
-            scene.load(mapped)
-        source_data = np.asarray(scene[mapped[0]].data)
+            scene.load([dataset_name])
+
+        source_data = np.asarray(scene[dataset_name].data)
         if hasattr(source_data, "compute"):
             source_data = source_data.compute()
 
-        # Parse granule ID for satellite/scan info
+        # Parse satellite/scan info for LUT key
         satellite, scan_type = _parse_granule_id(granule_id)
+
         # LUT cache directory
-        lut_cache_dir = Path(task.output_dir) / "luts"
+        lut_cache_dir = local_dir / "luts"
         lut_cache_dir.mkdir(parents=True, exist_ok=True)
 
-        def _process_single_result(sr: SearchResult) -> bool:
+        artifact_rows: list[dict[str, Any]] = []
+
+        def _process_grid_cell(grid_cell: GridCell) -> dict[str, Any] | None:
             try:
-                grid_cell = sr.grid_cell
-                area_def = grid_cell.area_def(channel.resolution)
-                area_name = grid_cell.area_name(channel.resolution)
-                ts = first_sr.start_time.strftime("%Y%m%dT%H%M%S")
-                filename = f"{ts}_{first_sr.product_id}_{mapped[0]}_{area_name}.nc"
-                output_path = Path(task.output_dir) / filename
+                area_def = grid_cell.area_def(int(resolution))
+                area_name = grid_cell.area_name(int(resolution))
+                ts = start_time.strftime("%Y%m%dT%H%M%S")
+                filename = f"{ts}_{collection}_{dataset_name}_{area_name}.nc"
+                output_path = local_dir / filename
 
-                # check if output file already exists
                 if output_path.exists():
-                    return True
+                    logger.info("output_exists", path=str(output_path))
+                else:
+                    lut_key_str = _lut_key(satellite, scan_type, area_name)
 
-                lut_key_str = _lut_key(satellite, scan_type, area_name)
+                    with _lut_locks[lut_key_str]:
+                        valid_input_index, valid_output_index, index_array, target_shape, template = get_or_build_lut(
+                            scene, area_def, area_name, lut_key_str, lut_cache_dir, dataset_name
+                        )
 
-                # LUT-based resampling (fast, cached). Lock to avoid simultaneous build/write.
-                with LUT_LOCK:
-                    valid_input_index, valid_output_index, index_array, target_shape, template = get_or_build_lut(
-                        scene, area_def, area_name, lut_key_str, lut_cache_dir, mapped[0]
+                    resampled_data = apply_lookup_table(
+                        source_data, valid_input_index, valid_output_index, index_array, target_shape
                     )
 
-                resampled_data = apply_lookup_table(
-                    source_data, valid_input_index, valid_output_index, index_array, target_shape
-                )
+                    resampled_da = xr.DataArray(
+                        resampled_data.reshape(target_shape),
+                        coords=template["coords"],
+                        dims=template["dims"],
+                        attrs=template["attrs"],
+                        name=template["name"],
+                    )
 
-                # Wrap in xarray DataArray for save_dataset compatibility
-                resampled_da = xr.DataArray(
-                    resampled_data.reshape(target_shape),
-                    coords=template["coords"],
-                    dims=template["dims"],
-                    attrs=template["attrs"],
-                    name=template["name"],
-                )
+                    local_scene = scene.copy()
+                    local_scene[dataset_name] = resampled_da
+                    local_scene.save_dataset(dataset_id=dataset_name, filename=str(output_path))
+                    del resampled_da
+                    gc.collect()
 
-                # Use a local scene copy to ensure thread-safe saving
-                local_scene = scene_cp.copy()
-                local_scene[mapped[0]] = resampled_da
-                local_scene.save_dataset(dataset_id=mapped[0], filename=str(output_path))
-
-                # Free memory
-                del resampled_da
-                gc.collect()
-                return True
-
+                # Build artifact row
+                artifact_id = hashlib.md5(f"{granule_id}_{area_name}".encode()).hexdigest()
+                return {
+                    "id": artifact_id,
+                    "source_ids": source_ids,
+                    "start_time": start_time,
+                    "end_time": end_time,
+                    "uri": str(output_path),
+                    "geometry": grid_cell.geom,
+                    "collection": collection,
+                    "grid_cell": grid_cell.id(),
+                    "grid_dist": grid_cell.D,
+                    "cell_geometry": grid_cell.geom,
+                    "cell_utm_crs": str(grid_cell.utm_crs),
+                    "cell_utm_fooprint": grid_cell.utm_footprint,
+                }
             except Exception as exc:
-                logger.error("extract_failed", reason=str(exc), area_name=sr.grid_cell.area_name(channel.resolution))
-                return False
+                logger.error("grid_cell_extract_failed", error=str(exc), grid_cell=grid_cell.id())
+                return None
 
-        # Run extraction in parallel
-        # Note: ThreadPoolExecutor is used because resampling/saving involves I/O and GIL-releasing operations.
-        max_workers = kwargs.get("max_workers", 8)
+        # Process grid cells in parallel
+        max_workers = extract_params.get("max_workers", 8)
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = [executor.submit(_process_single_result, sr) for sr in search_results]
+            futures = [executor.submit(_process_grid_cell, gc_) for gc_ in grid_cells]
             for future in as_completed(futures):
-                if not future.result():
-                    return attrs.evolve(task, status=ExtractionStatus.FAILED)
-        logger.info("extract_success", channel=channel.c_id, granule_id=granule_id)
-        return attrs.evolve(task, status=ExtractionStatus.SUCCESS)
+                result = future.result()
+                if result is not None:
+                    artifact_rows.append(result)
+
+        if not artifact_rows:
+            raise ValueError(f"All grid cells failed for granule: {granule_id}")
+
+        gdf = gpd.GeoDataFrame(artifact_rows, geometry="geometry")
+        validated = ArtifactSchema.validate(gdf)
+        return cast(GeoDataFrame[ArtifactSchema], validated)
+
+    @override
+    def extract_batches(
+        self,
+        extraction_task_batch: Sequence[ExtractionTask],
+        extract_params: dict[str, Any] | None = None,
+    ) -> GeoDataFrame[ArtifactSchema]:
+        """Execute extraction over multiple granule batches in parallel.
+
+        Overrides the default sequential implementation to use ThreadPoolExecutor
+        for concurrent granule processing. Each batch downloads and processes
+        one granule, so parallelism here reduces total wall-clock time.
+        """
+        extract_params = extract_params or {}
+        max_batch_workers = extract_params.get("max_batch_workers", 4)
+
+        results: list[GeoDataFrame[ArtifactSchema]] = []
+        errors: list[str] = []
+
+        with ThreadPoolExecutor(max_workers=max_batch_workers) as executor:
+            futures = {
+                executor.submit(self.extract, batch, extract_params): i for i, batch in enumerate(extraction_task_batch)
+            }
+            for future in as_completed(futures):
+                batch_idx = futures[future]
+                try:
+                    df = future.result()
+                    results.append(df)
+                except Exception as exc:
+                    logger.error("batch_extract_failed", batch=batch_idx, error=str(exc))
+                    errors.append(str(exc))
+
+        if not results:
+            raise RuntimeError(f"All {len(extraction_task_batch)} batches failed. Errors: {errors}")
+
+        import pandas as pd
+
+        concatenated = pd.concat(results, ignore_index=True)
+        validated = ArtifactSchema.validate(concatenated)
+        return cast(GeoDataFrame[ArtifactSchema], validated)
