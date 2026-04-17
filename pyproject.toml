@@ -29,14 +29,14 @@ dependencies = [
 
 [project.entry-points."aer.plugins"]
 search_aws_goes = "aer.search_aws_goes.core:search_aws_goes"
-extract_aws_goes = "aer.extract_aws_goes.core:extract_aws_goes"
+extract_aws_goes = "aer.extract_aws_goes.core:AwsGoesExtractor"
 
 
 [tool.uv]
+sources.aer-extract-aws-goes = { workspace = true }
 sources.aer-core = { path = "/root/repos/aer/projects/aer-core", editable = true }
 sources.aer-search-aws-goes = { path = "/root/repos/aer-search-aws-goes/projects/aer-search-aws-goes", editable = true }
 sources.aer-search-earthaccess = { path = "/root/repos/aer-search-earthaccess/projects/aer-search-earthaccess", editable = true }
-sources.aer-extract-aws-goes = { workspace = true }
 managed = true
 
 [tool.uv.workspace]
@@ -70,8 +70,13 @@ extraPaths = ["components/", "bases/"]
 dev = [
     "aer-extract-aws-goes",
     "aer-search-aws-goes>=2.1.0,<3.0.0",
+    "ipykernel>=7.2.0",
+    "jupyter>=1.1.1",
+    "line-profiler>=5.0.2",
+    "marimo>=0.21.1",
     "matplotlib>=3.10.8",
     "polylith-cli>=1.43.0,<2.0.0",
     "pytest>=9.0.2,<10.0.0",
     "python-semantic-release>=10.5.3,<11.0.0",
+    "scalene>=2.2.1",
 ]

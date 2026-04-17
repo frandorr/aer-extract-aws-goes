@@ -31,9 +31,10 @@ Issues = "https://github.com/frandorr/aer-extract-aws-goes/issues"
 Repository = "https://github.com/frandorr/aer-extract-aws-goes"
 
 [project.entry-points."aer.plugins"]
-extract_aws_goes = "aer.extract_aws_goes.core:extract_aws_goes"
+extract_aws_goes = "aer.extract_aws_goes.core:AwsGoesExtractor"
 
 [tool.hatch]
+build.dev-mode-dirs = [ "../../components", "../../bases", "../../development", "." ]
 build.hooks.polylith-bricks = {}
 build.targets.wheel.packages = ["aer"]
 
