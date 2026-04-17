@@ -1,12 +1,23 @@
+from datetime import datetime, timezone
 from pathlib import Path
+from typing import Sequence
 from unittest.mock import MagicMock, patch
 
-from aer.extract import ExtractionTask
-from aer.extract.core import ExtractionStatus
-from aer.extract_aws_goes.core import detect_reader, extract_aws_goes, map_channel_ids_to_satpy_names
+import geopandas as gpd
+import numpy as np
+import pandas as pd
+import pytest
+from aer.extract_aws_goes.core import (
+    AwsGoesExtractor,
+    detect_reader,
+    map_channel_ids_to_satpy_names,
+)
+from aer.interfaces import Extractor, ExtractionTask
+from aer.schemas import ArtifactSchema, AssetSchema
+from shapely.geometry import box
 
 
-# --- detect_reader tests ---
+# --- detect_reader tests (unchanged) ---
 
 
 def test_detect_reader_l1b() -> None:
@@ -26,7 +37,7 @@ def test_detect_reader_unknown() -> None:
     assert detect_reader("UNKNOWN.nc") is None
 
 
-# --- map_channel_ids_to_satpy_names tests ---
+# --- map_channel_ids_to_satpy_names tests (unchanged) ---
 
 
 def test_map_direct_match() -> None:
@@ -46,90 +57,79 @@ def test_map_empty() -> None:
     assert map_channel_ids_to_satpy_names(set(), {"C01"}) == []
 
 
-# --- extract_aws_goes tests ---
+# --- AwsGoesExtractor class tests ---
 
 
-def _make_task(granule_id: str, c_id: str, resolution: int = 2000) -> ExtractionTask:
-    """Build a minimal ExtractionTask for testing."""
-    mock_channel = MagicMock()
-    mock_channel.c_id = c_id
-    mock_channel.resolution = resolution
+def test_extractor_is_subclass() -> None:
+    """AwsGoesExtractor must be a valid Extractor subclass."""
+    assert issubclass(AwsGoesExtractor, Extractor)
 
-    mock_grid_cell = MagicMock()
-    mock_grid_cell.area_def.return_value = MagicMock()
-    mock_grid_cell.area_name.return_value = "22U_107L_100km_2000m"
 
-    mock_grid = MagicMock()
-    mock_grid.grid_cell = mock_grid_cell
+def test_extractor_supported_collections() -> None:
+    """supported_collections must be a non-empty sequence."""
+    extractor = AwsGoesExtractor()
+    assert isinstance(extractor.supported_collections, (list, tuple, set))
+    assert len(extractor.supported_collections) > 0
 
-    mock_sr = MagicMock()
-    mock_sr.granule_id = granule_id
-    mock_sr.channel = mock_channel
-    mock_sr.grid = mock_grid
 
-    return ExtractionTask(
-        search_result=mock_sr,
-        output_dir=Path("/tmp/test_extract"),
+def test_extractor_target_grid_d() -> None:
+    """target_grid_d must return 100000."""
+    extractor = AwsGoesExtractor()
+    assert extractor.target_grid_d == 100_000
+
+
+def test_extractor_target_grid_overlap() -> None:
+    """target_grid_overlap must return False."""
+    extractor = AwsGoesExtractor()
+    assert extractor.target_grid_overlap is False
+
+
+# --- prepare_for_extraction tests ---
+
+
+def _make_asset_gdf(n: int = 1, granule_id: str = "test_granule.nc") -> gpd.GeoDataFrame:
+    """Build a minimal AssetSchema-compliant GeoDataFrame."""
+    rows = []
+    for i in range(n):
+        rows.append(
+            {
+                "id": f"asset_{i}",
+                "collection": "ABI-L1b-RadF",
+                "geometry": box(-80, 20, -70, 30),
+                "start_time": datetime(2025, 6, 1, 12, 0, 0, tzinfo=timezone.utc),
+                "end_time": datetime(2025, 6, 1, 12, 10, 0, tzinfo=timezone.utc),
+                "href": f"s3://noaa-goes19/ABI-L1b-RadF/2025/152/12/{granule_id}",
+                "granule_id": granule_id,
+                "channel_id": "1",
+            }
+        )
+    return gpd.GeoDataFrame(rows, geometry="geometry")
+
+
+def test_prepare_groups_by_granule() -> None:
+    """prepare_for_extraction should group assets by granule_id."""
+    extractor = AwsGoesExtractor()
+    gdf = pd.concat(
+        [
+            _make_asset_gdf(2, "granule_A.nc"),
+            _make_asset_gdf(3, "granule_B.nc"),
+        ],
+        ignore_index=True,
     )
+    gdf = gpd.GeoDataFrame(gdf, geometry="geometry")
+
+    tasks = extractor.prepare_for_extraction(gdf, resolution=2000.0, uri="/tmp/test_output")
+
+    assert len(tasks) == 2  # Two granules
+    # Check task_context has granule_id
+    granule_ids = {t.task_context["granule_id"] for t in tasks}
+    assert granule_ids == {"granule_A.nc", "granule_B.nc"}
 
 
-@patch("aer.extract_aws_goes.core.compute_writer_results")
-@patch("aer.extract_aws_goes.core.download")
-@patch("aer.extract_aws_goes.core.satpy.Scene")
-@patch("aer.search.core.SearchResult.to_gdf")
-def test_extract_success(mock_to_gdf, mock_scene_cls, mock_download, mock_compute, tmp_path):
-    mock_scene = MagicMock()
-    mock_scene.available_dataset_names.return_value = ["C01"]
-    mock_resampled = MagicMock()
-    mock_resampled.save_datasets.return_value = ["delayed"]
-    mock_scene.resample.return_value = mock_resampled
-    mock_scene_cls.return_value = mock_scene
+def test_prepare_requires_resolution_and_uri() -> None:
+    """prepare_for_extraction should raise ValueError if resolution or uri is None."""
+    extractor = AwsGoesExtractor()
+    gdf = _make_asset_gdf()
 
-    mock_to_gdf.return_value = MagicMock()
-
-    downloaded_gdf = MagicMock()
-    downloaded_gdf.iloc = [{"local_path": str(tmp_path / "test.nc")}]
-    mock_download.return_value = downloaded_gdf
-
-    task = _make_task(
-        "OR_ABI-L1b-RadF-M6C01_G19_s20251520000203_e20251520009510.nc",
-        "1",
-    )
-    task = ExtractionTask(
-        search_result=task.search_result,
-        output_dir=tmp_path,
-    )
-    result = extract_aws_goes(task)
-
-    assert result.status == ExtractionStatus.SUCCESS
-    mock_scene.load.assert_called_once_with(["C01"])
-    mock_scene.resample.assert_called_once()
-    mock_compute.assert_called_once()
-
-
-def test_extract_unknown_reader():
-    task = _make_task("UNKNOWN_FILE.nc", "1")
-    result = extract_aws_goes(task)
-    assert result.status == ExtractionStatus.FAILED
-
-
-def test_extract_no_channel():
-    mock_sr = MagicMock()
-    mock_sr.granule_id = "OR_ABI-L1b-RadF-M6C01_G19_s20251520000203.nc"
-    mock_sr.channel = None
-    mock_sr.grid = MagicMock()
-
-    task = ExtractionTask(search_result=mock_sr, output_dir=Path("/tmp"))
-    result = extract_aws_goes(task)
-    assert result.status == ExtractionStatus.FAILED
-
-
-def test_extract_no_grid():
-    mock_sr = MagicMock()
-    mock_sr.granule_id = "OR_ABI-L1b-RadF-M6C01_G19_s20251520000203.nc"
-    mock_sr.channel = MagicMock()
-    mock_sr.grid = None
-
-    task = ExtractionTask(search_result=mock_sr, output_dir=Path("/tmp"))
-    result = extract_aws_goes(task)
-    assert result.status == ExtractionStatus.FAILED
+    with pytest.raises(ValueError, match="resolution and uri"):
+        extractor.prepare_for_extraction(gdf)
