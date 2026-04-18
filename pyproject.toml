@@ -15,6 +15,7 @@ dependencies = [
     "aer-search-aws-goes",
     "attrs>=25.4.0",
     "h5netcdf[h5py]>=1.8.1",
+    "majortom-eg>=1.0.0,<2.0.0",
     "netcdf4>=1.7.4",
     "pendulum>=3.2.0",
     "pyarrow>=23.0.1",
@@ -37,6 +38,7 @@ sources.aer-extract-aws-goes = { workspace = true }
 sources.aer-core = { path = "/root/repos/aer/projects/aer-core", editable = true }
 sources.aer-search-aws-goes = { path = "/root/repos/aer-search-aws-goes/projects/aer-search-aws-goes", editable = true }
 sources.aer-search-earthaccess = { path = "/root/repos/aer-search-earthaccess/projects/aer-search-earthaccess", editable = true }
+sources.majortom-eg = { path = "/root/repos/majortom/src/majortom_eg", editable = true }
 managed = true
 
 [tool.uv.workspace]

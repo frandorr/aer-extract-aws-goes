@@ -2,13 +2,14 @@
 gsd_state_version: 1.0
 milestone: v0.1
 milestone_name: milestone
-status: in-progress
-last_updated: "2026-04-17"
+status: unknown
+last_updated: "2026-04-17T13:57:30.441Z"
+last_activity: "2026-03-27 - Completed quick task 260327-mov: Parallelize search_results loop in extract_aws_goes"
 progress:
   total_phases: 6
-  completed_phases: 6
-  total_plans: 1
-  completed_plans: 1
+  completed_phases: 2
+  total_plans: 6
+  completed_plans: 3
 ---
 
 # Project State: aer-extract-aws-goes
