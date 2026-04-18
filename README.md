@@ -1,110 +1,62 @@
-# 🚀 aer Plugin Template
+# 🚀 aer-extract-aws-goes
 
-Welcome to the **aer plugin template**! This repository is your starting point for building high-performance, modular plugins for the `aer` ecosystem. 
+Welcome to the **aer-extract-aws-goes** plugin! This repository provides an extractor plugin for the `aer` ecosystem to download and process GOES ABI satellite data from AWS.
 
-Powered by the [Polylith architecture](https://davidvujic.github.io/python-polylith-docs/setup/) and `uv` for lightning-fast dependency management, this template ensures your plugin is scalable, maintainable, and ready for production.
+## ⚡ Overview
 
----
+This plugin implements the `AwsGoesExtractor` class which inherits from the `aer.interfaces.Extractor` base class. It enables seamless extraction, resampling, and grid-based storage of GOES satellite granules.
 
-## ⚡ Quick Start
+### Key Features
+- **Automated Download**: Fetches NetCDF granules anonymously from AWS S3.
+- **satpy Integration**: Automatically detects and builds `satpy` Scenes (supports ABI-L1b and ABI-L2 collections).
+- **Grid Resampling**: Resamples data to predefined overlapping grid cells using LUT-cached nearest-neighbor interpolation.
+- **GeoTIFF / NetCDF Saving**: Outputs standard artifacts that preserve geospatial metadata.
+- **Concurrent Batching**: Extracts grid cells in parallel across multiple worker threads and processes.
 
-If you are new here, **start with the setup script**. It will bootstrap your environment, name your project, and create your first component automatically.
-
-```bash
-chmod +x setup.sh
-./setup.sh
-```
-
-<details>
-<summary><b>🔍 What does the setup script do?</b></summary>
-
-The `setup.sh` script automates the tedious parts of starting a new Polylith plugin:
-1.  **Validation**: Ensures your project name follows the `aer-` prefix rule.
-2.  **Environment**: Installs `uv` (if missing) and sets up the workspace dependencies.
-3.  **Scaffolding**: Creates your first **Component** (for code) and **Project** (for packaging).
-4.  **Configuration**: Generates a pre-configured `pyproject.toml` with standard entry points so `aer-core` can immediately find your plugin.
-5.  **Git Hooks**: Installs `prek` to ensure high-quality commits from day one.
-</details>
-
-> [!IMPORTANT]
-> The setup script is mandatory for new project initialization. It ensures consistent naming conventions (`aer-` prefix) and registers your plugin entry points correctly.
+### Supported Collections
+- `ABI-L1b-RadC`, `ABI-L1b-RadF`, `ABI-L1b-RadM`
+- `ABI-L2-AODC`, `ABI-L2-AODF`
+- `ABI-L2-BRFC`, `ABI-L2-BRFF`, `ABI-L2-BRFM`
 
 ---
 
-## 🏗️ Architecture Overview
+## 🛠️ Usage
 
-This project uses a **Polylith** structure. Instead of a messy monolith, code is organized into:
+The plugin provides the following entry points for the `aer` ecosystem:
 
-*   **Components**: Pure logic and functionality (found in `components/`).
-*   **Projects**: Deployable artifacts like PyPI packages (found in `projects/`).
-*   **Bases**: Public APIs or entry points (CLI, FastAPI, etc.).
-
-### Why Polylith?
-It allows you to share code between different projects within the same workspace perfectly, while keeping your deployments lean.
-
----
-
-## 🛠️ Development Workflow
-
-Once you've run the setup script, here is how you work with your new plugin:
-
-### 1. Project Info
-See the state of your workspace, which components are used by which projects:
-```bash
-uv run poly info
+```toml
+[project.entry-points."aer.plugins"]
+extract_aws_goes = "aer.extract_aws_goes.core:AwsGoesExtractor"
 ```
 
-### 2. Adding Dependencies
-Use `uv` to manage your environment:
-```bash
-uv add requests          # Add to the workspace
-uv add --group dev pytest  # Add development tools
-```
+The extractor can be instantiated natively via the `aer` plugin system, which handles routing the search results to the extraction task seamlessly.
 
-### 3. Running Tests
-Tests are enabled globally. Run them with:
-```bash
-uv run pytest
+### Example (via aer core)
+
+```python
+from aer.repository import get_extractor
+
+# Initialize the extractor
+extractor = get_extractor("extract_aws_goes", target_grid_d=100_000)
+
+# Tasks generated from search results
+tasks = extractor.prepare_for_extraction(
+    search_results=search_results, 
+    uri="/path/to/extracted/items"
+)
+
+# Extract artifacts to grid cells
+artifacts_df = extractor.extract_batches(tasks, extract_params={"max_workers": 8})
 ```
 
 ---
 
-## 📦 Creating More Components (Advanced)
+## 🏗️ Architecture
 
-If your plugin grows and you need to split logic into more components, you can use the Polylith CLI:
-
-```bash
-# Create a new component
-uv run poly create component --name my_new_feature
-
-# Create a new project (if you want to ship a separate package)
-uv run poly create project --name aer-my-other-package
-```
-
----
-
-## 🚀 Releasing Plugins
-
-Releases are automated using [Conventional Commits](https://www.conventionalcommits.org/) and `python-semantic-release`.
-
-1.  **Commit with prefixes**: Use `feat:`, `fix:`, or `chore:` in your commit messages.
-2.  **Run the release script**:
-    ```bash
-    # Release a specific project
-    python3 .agents/scripts/release.py aer-my-plugin
-
-    # Release all changed projects
-    python3 .agents/scripts/release.py --changed
-    ```
-
-### 🤖 Agentic Workflow
-If you are working with **Antigravity** or another AI assistant, you can simply say:
-> "Release my plugin" or "Create a new release for aer-search-earthaccess"
-
-The assistant will use the `new-release` skill to handle the versioning, tagging, and pushing for you.
-
----
+This project uses a **Polylith** structure. Code is organized into:
+- **Components**: The core logic under `components/`.
+- **Projects**: Deployable packaging under `projects/`.
 
 ## 📜 License
 
-This template is licensed under the [MIT License](LICENSE).
+This plugin is licensed under the [MIT License](LICENSE).
