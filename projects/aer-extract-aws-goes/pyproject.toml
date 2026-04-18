@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "aer-extract-aws-goes"
-version = "1.3.1"
+version = "1.4.0"
 description = "Polylith project for the extract-aws-goes plugin"
 readme = "README.md"
 authors = [{ name = "Fran Dorr" }]
