@@ -13,6 +13,7 @@ from aer.interfaces import ExtractionTask, Extractor
 from aer.repository import AerLocalSpectralRepository
 from aer.schemas import ArtifactSchema, AssetSchema
 from pandera.typing.geopandas import GeoDataFrame
+from pyresample.area_config import load_area_from_string
 from satpy.scene import Scene
 from shapely.geometry.base import BaseGeometry
 from structlog import get_logger
@@ -242,7 +243,8 @@ class AwsGoesExtractor(Extractor, plugin_abstract=False):
 
         def _process_grid_cell(grid_cell: GridCell) -> dict[str, Any] | None:
             try:
-                area_def = grid_cell.area_def(int(resolution))
+                area_def_model = grid_cell.area_def(int(resolution))
+                area_def = load_area_from_string(area_def_model.to_yaml(), area_def_model.area_id)
                 area_name = grid_cell.area_name(int(resolution))
                 ts = start_time.strftime("%Y%m%dT%H%M%S")
                 filename = f"{ts}_{collection}_{dataset_name}_{area_name}.tif"
