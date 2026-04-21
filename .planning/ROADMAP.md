@@ -51,3 +51,20 @@ Plans:
 
 Plans:
 - [x] TBD (run /gsd-plan-phase 6 to break down)
+
+## Phase 7: Group grid cells by UTM zone for optimized extraction (Status: Complete)
+- [x] Goal: Minimize expensive resampling operations by grouping grid cells by UTM zone.
+- [x] Plans:
+  - [x] Implement UTM grouping in `AwsGoesExtractor.extract`.
+  - [x] Resample once per UTM group.
+  - [x] Verify with mock tests and baseline tests.
+
+### Phase 8: UTM zone lookup table extraction engine (Status: Planned)
+
+**Goal:** Create a GOES extractor that uses pre-computed UTM zone lookup tables to eliminate runtime reprojection entirely. Offline: compute GOES→UTM reprojection indices for each UTM zone at multiple resolutions (500m, 1000m, 2000m) and store them as chunked, fast-access Zarr arrays. Online: given a grid_cell, load the corresponding UTM zone LUT and extract the sub-region by simple index slicing — no reprojection needed.
+**Requirements**: REQ-08.1, REQ-08.2, REQ-08.3, REQ-08.4
+**Depends on:** Phase 7
+**Plans:** 0 plans
+
+Plans:
+- [ ] TBD (run /gsd-plan-phase 8 to break down)
