@@ -257,3 +257,94 @@ def detect_goes_utm_zones(source_area_def: AreaDefinition) -> list[int]:
                 utm_zones.append(epsg)
                 
     return sorted(utm_zones)
+
+
+def compute_cell_slice(
+    cell_utm_footprint_bounds: tuple[float, float, float, float],
+    lut_area_extent: tuple[float, float, float, float],
+    resolution: int,
+) -> tuple[slice, slice]:
+    """Compute row/col slices within a UTM zone LUT for a grid cell.
+
+    Given the UTM footprint bounds of a grid cell and the area extent
+    of the full UTM zone LUT, return (row_slice, col_slice) to extract
+    exactly the grid cell's region from the LUT arrays.
+
+    Parameters
+    ----------
+    cell_utm_footprint_bounds : (minx, miny, maxx, maxy)
+        Bounds of the grid cell in its UTM CRS (meters).
+    lut_area_extent : (minx, miny, maxx, maxy)
+        Full extent of the UTM zone LUT (meters).
+    resolution : int
+        Pixel size in meters.
+
+    Returns
+    -------
+    (row_slice, col_slice) : tuple of slices
+        Slices into the 2D (height, width) LUT grid.
+    """
+    lut_minx, lut_miny, lut_maxx, lut_maxy = lut_area_extent
+    cell_minx, cell_miny, cell_maxx, cell_maxy = cell_utm_footprint_bounds
+
+    # Column indices (x-axis, left to right)
+    col_start = int(round((cell_minx - lut_minx) / resolution))
+    col_end = int(round((cell_maxx - lut_minx) / resolution))
+
+    # Row indices (y-axis, top to bottom — maxy is row 0)
+    lut_height = int(round((lut_maxy - lut_miny) / resolution))
+    row_start = lut_height - int(round((cell_maxy - lut_miny) / resolution))
+    row_end = lut_height - int(round((cell_miny - lut_miny) / resolution))
+
+    return slice(row_start, row_end), slice(col_start, col_end)
+
+
+def extract_cell_from_lut(
+    source_data: np.ndarray,
+    lut_group: zarr.Group,
+    cell_row_slice: slice,
+    cell_col_slice: slice,
+    lut_height: int,
+    lut_width: int,
+) -> np.ndarray:
+    """Extract a grid cell's data using pre-computed LUT arrays.
+
+    Loads only the LUT chunks covering the cell region, then applies
+    get_sample_from_neighbour_info for the cell sub-grid.
+
+    Parameters
+    ----------
+    source_data : np.ndarray
+        Flattened 1D source data from the GOES file.
+    lut_group : zarr.Group
+        Opened Zarr group containing valid_input_index, valid_output_index, index_array.
+    cell_row_slice, cell_col_slice : slices
+        Row and column slices within the full UTM zone LUT grid.
+    lut_height, lut_width : int
+        Full dimensions of the UTM zone grid.
+
+    Returns
+    -------
+    np.ndarray
+        2D array of shape (cell_height, cell_width) with extracted data.
+    """
+    # Convert 2D cell slices to 1D flat indices within the full LUT
+    cell_height = cell_row_slice.stop - cell_row_slice.start
+    cell_width = cell_col_slice.stop - cell_col_slice.start
+
+    # Build flat index mask for the cell region within the full LUT
+    rows = np.arange(cell_row_slice.start, cell_row_slice.stop)
+    cols = np.arange(cell_col_slice.start, cell_col_slice.stop)
+    row_grid, col_grid = np.meshgrid(rows, cols, indexing='ij')
+    flat_indices = (row_grid * lut_width + col_grid).ravel()
+
+    # Load only the needed chunks from Zarr
+    valid_output = lut_group['valid_output_index'][flat_indices]
+    index_arr = lut_group['index_array'][flat_indices]
+
+    # Apply the LUT: for each valid output pixel, fetch source data at index_arr position
+    result = np.full(cell_height * cell_width, np.nan, dtype=np.float32)
+    valid_mask = valid_output.astype(bool)
+    result[valid_mask] = source_data.ravel()[index_arr[valid_mask]]
+
+    return result.reshape(cell_height, cell_width)
