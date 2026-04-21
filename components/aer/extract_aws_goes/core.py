@@ -124,8 +124,8 @@ class AwsGoesExtractor(Extractor, plugin_abstract=False):
         resolution: float | None = None,
         prepare_params: dict | None = None,
     ) -> GeoDataFrame[AssetSchema]:
-        """
-        Add a 'resolution' column to the search results based on the 'channel_id' column.
+        """Add a 'resolution' column to the search results based on the 'channel_id' column.
+
         If 'channel_id' is missing, use the provided resolution for all rows.
         If prepare_params contains resolution overrides for specific channel_ids, use those as a fallback:
         - Look for keys in prepare_params that match the pattern 'resolution_{channel_id}'.
@@ -133,13 +133,14 @@ class AwsGoesExtractor(Extractor, plugin_abstract=False):
             initial resolution lookup returned None.
 
         Args:
-            search_results: GeoDataFrame containing the search results with an optional 'channel_id' column
-            resolution: Default resolution to use if 'channel_id' is missing
-            prepare_params: Optional dictionary that may contain resolution overrides in the format 'resolution_{channel_id}': value
+            search_results: GeoDataFrame containing the search results with an optional 'channel_id' column.
+            resolution: Default resolution to use if 'channel_id' is missing.
+            prepare_params: Optional dictionary that may contain resolution overrides in the format
+                'resolution_{channel_id}': value.
 
         Returns:
-            GeoDataFrame with an added 'resolution' column based on 'channel_id' lookups and prepare_params overrides
-
+            GeoDataFrame with an added 'resolution' column based on 'channel_id' lookups and
+            prepare_params overrides.
         """
         df = search_results.copy()
         if "channel_id" not in df.columns:
@@ -177,9 +178,19 @@ class AwsGoesExtractor(Extractor, plugin_abstract=False):
         uri: str | None = None,
         prepare_params: dict[str, Any] | None = None,
     ) -> Sequence[ExtractionTask]:
-        """
-        Override the default implementation to set resolution based on GOES product.
-        We'll take resolutions from Instruments Repository provided bt aer-core
+        """Override the default implementation to set resolution based on GOES product.
+
+        We'll take resolutions from Instruments Repository provided bt aer-core.
+
+        Args:
+            search_results: GeoDataFrame containing the search results.
+            target_aoi: Optional AOI to filter/clip to.
+            resolution: Fixed resolution to use if not derived from assets.
+            uri: Target URI for extraction artifacts.
+            prepare_params: Optional parameters for task preparation.
+
+        Returns:
+            Sequence of ExtractionTask objects.
         """
         if uri is None:
             raise ValueError(
@@ -208,7 +219,10 @@ class AwsGoesExtractor(Extractor, plugin_abstract=False):
                 resolution=group_res,
                 uri=uri,
                 aoi=target_aoi,
-                task_context={"prepare_params": prepare_params, "granule_id": str(granule_id)},
+                task_context={
+                    "prepare_params": prepare_params,
+                    "granule_id": str(granule_id),
+                },
             )
             tasks.append(task)
         return tasks
@@ -225,17 +239,19 @@ class AwsGoesExtractor(Extractor, plugin_abstract=False):
 
         Set ``extract_params["engine"] = "gdal"`` for the fastest performance.
         Other engines: ``"rasterio"``, ``"satpy"`` (default).
+
+        Args:
+            extraction_task: The task containing assets and grid cells to extract.
+            extract_params: Optional parameters for the extraction engine.
+
+        Returns:
+            GeoDataFrame containing references to extracted artifacts.
         """
         extract_params = extract_params or {}
-        engine = extract_params.get("engine", "satpy")
-
-        if engine == "lut":
+        if extract_params.get("engine") == "satpy":
+            return self._extract_satpy(extraction_task, extract_params)
+        else:
             return self._extract_lut(extraction_task, extract_params)
-        if engine == "gdal":
-            return self._extract_gdal(extraction_task, extract_params)
-        if engine == "rasterio":
-            return self._extract_rasterio(extraction_task, extract_params)
-        return self._extract_satpy(extraction_task, extract_params)
 
     # ── LUT-based extraction ───────────────────────────────
 
@@ -246,11 +262,19 @@ class AwsGoesExtractor(Extractor, plugin_abstract=False):
     ) -> GeoDataFrame[ArtifactSchema]:
         """Extract using pre-computed UTM zone lookup tables — zero reprojection.
 
-        Required extract_params:
-            lut_dir (str): Path to the root LUT directory containing Zarr stores.
-        Optional extract_params:
-            calibration (str): 'radiance', 'reflectance', or 'brightness_temperature' (default: 'radiance')
-            max_workers (int): Thread pool workers for parallel cell extraction (default: 16)
+        Args:
+            extraction_task: The task containing assets and grid cells to extract.
+            extract_params: Dictionary of parameters.
+                Required:
+                    lut_dir (str): Path to root LUT directory containing Zarr stores.
+                Optional:
+                    calibration (str): 'radiance', 'reflectance', or 'brightness_temperature'
+                        (default: 'counts').
+                    max_workers (int): Thread pool workers for parallel cell extraction
+                        (default: 16).
+
+        Returns:
+            GeoDataFrame containing references to extracted artifacts.
         """
         from aer.extract_aws_goes.lut import get_default_lut_dir
 
@@ -283,19 +307,14 @@ class AwsGoesExtractor(Extractor, plugin_abstract=False):
             fs.get(href.replace("s3://", ""), str(local_path))
         logger.info("file_downloaded", local_path=str(local_path))
 
-        # Read source data as flat array
-        import xarray as xr
-        ds = xr.open_dataset(str(local_path))
         # Determine variable name based on product
         src_path = self._detect_subdataset(str(local_path), channel_id)
         var_name = src_path.split(":")[-1] if ":" in src_path else "Rad"
-        source_data = ds[var_name].values.astype(np.float32).ravel()
-        ds.close()
 
         # Calibration
-        calibration = extract_params.get("calibration", "radiance")
+        calibration = extract_params.get("calibration", "counts")
         cal_params = {}
-        if calibration != "radiance":
+        if calibration not in ("radiance", "counts"):
             cal_params = self._read_abi_calibration_params(src_path)
 
         dataset_name = f"C{int(channel_id):02d}" if channel_id.isdigit() else channel_id
@@ -303,7 +322,13 @@ class AwsGoesExtractor(Extractor, plugin_abstract=False):
 
         # Group grid cells by UTM zone for LUT loading
         from collections import defaultdict
-        from aer.extract_aws_goes.lut import compute_cell_slice, extract_cell_from_lut, load_utm_zone_lut
+        from aer.extract_aws_goes.lut import (
+            compute_cell_slice,
+            compute_source_crop_slices,
+            extract_cell_from_lut,
+            load_utm_zone_lut,
+            read_goes_crop,
+        )
 
         utm_groups: dict[int, list[GridCell]] = defaultdict(list)
         for gc_ in grid_cells:
@@ -323,24 +348,63 @@ class AwsGoesExtractor(Extractor, plugin_abstract=False):
                 lut_height = lut_info.height
                 lut_width = lut_info.width
 
+                # Compute the minimal crop of the GOES source needed for this UTM zone
+                valid_input_index = np.asarray(lut_group["valid_input_index"][:])
+                source_shape = lut_info.source_shape
+                if source_shape is None:
+                    raise ValueError(
+                        f"LUT for EPSG:{utm_epsg} missing source_shape; "
+                        "regenerate with the latest generate_utm_zone_lut"
+                    )
+                src_row_sl, src_col_sl, row_offsets, col_offsets = compute_source_crop_slices(
+                    valid_input_index, source_shape
+                )
+                # Read only the needed crop from the GOES file via h5py
+                apply_scale_offset = calibration != "counts"
+                source_crop = read_goes_crop(
+                    local_path, src_row_sl, src_col_sl, variable=var_name, apply_scale_offset=apply_scale_offset
+                )
+                logger.info(
+                    "source_crop_loaded",
+                    utm_epsg=utm_epsg,
+                    crop_shape=source_crop.shape,
+                    full_shape=source_shape,
+                )
+
                 def _extract_one(gc_):
                     try:
                         bounds = gc_.utm_footprint.bounds  # (minx, miny, maxx, maxy)
-                        row_sl, col_sl = compute_cell_slice(bounds, lut_extent, int(resolution))
+                        # Use area_def dimensions as authoritative pixel counts to avoid
+                        # fencepost errors from non-aligned UTM footprint bounds.
+                        area_def = gc_.area_def(int(resolution))
+                        row_sl, col_sl, eff_extent = compute_cell_slice(
+                            bounds,
+                            lut_extent,
+                            int(resolution),
+                            target_width=area_def.width,
+                            target_height=area_def.height,
+                        )
 
                         cell_data = extract_cell_from_lut(
-                            source_data, lut_group, row_sl, col_sl, lut_height, lut_width
+                            source_crop,
+                            row_offsets,
+                            col_offsets,
+                            lut_group,
+                            row_sl,
+                            col_sl,
+                            lut_height,
+                            lut_width,
                         )
 
                         # Apply calibration
-                        if calibration != "radiance" and cal_params:
+                        if calibration not in ("radiance", "counts") and cal_params:
                             cell_data = self._apply_abi_calibration(cell_data, calibration, cal_params)
 
-                        # Save as GeoTIFF
+                        # Save as GeoTIFF — use the LUT-grid-aligned extent so
+                        # pixel values and geospatial coordinates are consistent.
                         area_name = gc_.area_name(int(resolution))
                         ts = start_time.strftime("%Y%m%dT%H%M%S")
-                        cal_suffix = "" if calibration == "radiance" else f"_{calibration[:3]}"
-                        filename = f"{ts}_{collection}_{dataset_name}_{area_name}{cal_suffix}.tif"
+                        filename = f"{ts}_{collection}_{dataset_name}_{area_name}.tif"
                         output_path = local_dir / filename
 
                         if not output_path.exists():
@@ -348,18 +412,19 @@ class AwsGoesExtractor(Extractor, plugin_abstract=False):
                             from rasterio.crs import CRS as RioCRS
                             from rasterio.transform import from_bounds
 
-                            area_def = gc_.area_def(int(resolution))
                             dst_crs = str(gc_.utm_crs)
                             if dst_crs.isdigit():
                                 dst_crs = f"EPSG:{dst_crs}"
-                            minx, miny, maxx, maxy = area_def.area_extent
-                            dst_transform = from_bounds(minx, miny, maxx, maxy, area_def.width, area_def.height)
+                            minx, miny, maxx, maxy = eff_extent
+                            cell_w = col_sl.stop - col_sl.start
+                            cell_h = row_sl.stop - row_sl.start
+                            dst_transform = from_bounds(minx, miny, maxx, maxy, cell_w, cell_h)
 
                             profile = {
                                 "driver": "GTiff",
                                 "dtype": "float32",
-                                "width": area_def.width,
-                                "height": area_def.height,
+                                "width": cell_w,
+                                "height": cell_h,
                                 "count": 1,
                                 "crs": RioCRS.from_user_input(dst_crs),
                                 "transform": dst_transform,
@@ -390,7 +455,12 @@ class AwsGoesExtractor(Extractor, plugin_abstract=False):
                             "cell_utm_footprint": gc_.utm_footprint,
                         }
                     except Exception as exc:
-                        logger.error("cell_extract_failed", error=str(exc), grid_cell=gc_.id(), engine="lut")
+                        logger.error(
+                            "cell_extract_failed",
+                            error=str(exc),
+                            grid_cell=gc_.id(),
+                            engine="lut",
+                        )
                         return None
 
                 max_workers = extract_params.get("max_workers", 16)
@@ -418,7 +488,15 @@ class AwsGoesExtractor(Extractor, plugin_abstract=False):
         extraction_task: ExtractionTask,
         extract_params: dict[str, Any],
     ) -> GeoDataFrame[ArtifactSchema]:
-        """Extract using satpy Scene.resample + rioxarray clip_box."""
+        """Extract using satpy Scene.resample + rioxarray clip_box.
+
+        Args:
+            extraction_task: The task containing assets and grid cells to extract.
+            extract_params: Dictionary of parameters for Satpy load and resample.
+
+        Returns:
+            GeoDataFrame containing references to extracted artifacts.
+        """
         assets = extraction_task.assets
         resolution = extraction_task.resolution
         uri = extraction_task.uri
@@ -463,7 +541,8 @@ class AwsGoesExtractor(Extractor, plugin_abstract=False):
 
         dataset_name = mapped[0]
         modifiers = extract_params.get("modifiers", "*")
-        scene.load([dataset_name], modifiers=modifiers)
+        calibration = extract_params.get("calibration", "counts")
+        scene.load([dataset_name], modifiers=modifiers, calibration=calibration)
 
         artifact_rows: list[dict[str, Any]] = []
 
@@ -483,11 +562,12 @@ class AwsGoesExtractor(Extractor, plugin_abstract=False):
 
                 # 2. Create AreaDefinition for the group
                 # Align extent to resolution to avoid sub-pixel shifts
+                # Add 2 pixels padding to avoid out-of-bounds indexing when extracting exactly like LUT
                 res = float(resolution)
-                minx = np.floor(minx / res) * res
-                miny = np.floor(miny / res) * res
-                maxx = np.ceil(maxx / res) * res
-                maxy = np.ceil(maxy / res) * res
+                minx = np.floor(minx / res) * res - res * 2
+                miny = np.floor(miny / res) * res - res * 2
+                maxx = np.ceil(maxx / res) * res + res * 2
+                maxy = np.ceil(maxy / res) * res + res * 2
 
                 width = int((maxx - minx) / res)
                 height = int((maxy - miny) / res)
@@ -507,9 +587,18 @@ class AwsGoesExtractor(Extractor, plugin_abstract=False):
                 )
 
                 # 3. Resample scene once for this group
-                logger.info("resampling_group", utm_crs=utm_crs, num_cells=len(group_cells), width=width, height=height)
+                logger.info(
+                    "resampling_group",
+                    utm_crs=utm_crs,
+                    num_cells=len(group_cells),
+                    width=width,
+                    height=height,
+                )
                 resampled_scene = scene.resample(
-                    destination=group_area_def, datasets=[dataset_name], resampler="nearest", unload=False
+                    destination=group_area_def,
+                    datasets=[dataset_name],
+                    resampler="nearest",
+                    unload=False,
                 )
                 group_resampled_da = resampled_scene[dataset_name]
                 # Ensure CRS is set for rioxarray
@@ -527,37 +616,50 @@ class AwsGoesExtractor(Extractor, plugin_abstract=False):
                         if output_path.exists():
                             logger.info("output_exists", path=str(output_path))
                         else:
-                            # Use reproject to the cell's area definition to guarantee exact shape (e.g. 20x20)
-                            # Since we are in the same CRS and resolution, this is a very fast alignment-correct slice.
-                            cell_area_def = gc_.area_def(int(resolution))
+                            import rasterio
                             from rasterio.transform import from_bounds
-                            from rasterio.warp import Resampling
+                            from aer.extract_aws_goes.lut import compute_cell_slice
+
+                            cell_area_def = gc_.area_def(int(resolution))
+                            row_sl, col_sl, eff_extent = compute_cell_slice(
+                                gc_.utm_footprint.bounds,
+                                group_area_def.area_extent,
+                                int(resolution),
+                                target_width=cell_area_def.width,
+                                target_height=cell_area_def.height,
+                            )
+
+                            full_arr = group_resampled_da.values
+                            if len(full_arr.shape) == 3 and full_arr.shape[0] == 1:
+                                full_arr = full_arr[0]
+                            cell_data = full_arr[row_sl, col_sl]
 
                             dst_crs = str(gc_.utm_crs)
                             if dst_crs.isdigit():
                                 dst_crs = f"EPSG:{dst_crs}"
 
-                            dst_transform = from_bounds(
-                                *cell_area_def.area_extent, cell_area_def.width, cell_area_def.height
-                            )
-                            cell_da = group_resampled_da.rio.reproject(
-                                dst_crs,
-                                shape=(cell_area_def.height, cell_area_def.width),
-                                transform=dst_transform,
-                                resampling=Resampling.nearest,
-                            )
+                            minx, miny, maxx, maxy = eff_extent
+                            cell_w = col_sl.stop - col_sl.start
+                            cell_h = row_sl.stop - row_sl.start
+                            dst_transform = from_bounds(minx, miny, maxx, maxy, cell_w, cell_h)
 
-                            # Save as GeoTIFF with optimized creation options
-                            cell_da.rio.to_raster(
-                                str(output_path),
-                                dtype=np.float32,
-                                compress="DEFLATE",
-                                predictor=2,
-                                zlevel=1,
-                                tiled=True,
-                                blockxsize=512,
-                                blockysize=512,
-                            )
+                            profile = {
+                                "driver": "GTiff",
+                                "dtype": "float32",
+                                "width": cell_w,
+                                "height": cell_h,
+                                "count": 1,
+                                "crs": rasterio.crs.CRS.from_user_input(dst_crs),
+                                "transform": dst_transform,
+                                "compress": "deflate",
+                                "predictor": 2,
+                                "zlevel": 1,
+                                "tiled": True,
+                                "blockxsize": 512,
+                                "blockysize": 512,
+                            }
+                            with rasterio.open(str(output_path), "w", **profile) as dst:
+                                dst.write(cell_data.astype(np.float32), 1)
                             logger.info("cell_extracted", path=str(output_path))
 
                         # Build artifact row
@@ -577,7 +679,11 @@ class AwsGoesExtractor(Extractor, plugin_abstract=False):
                             "cell_utm_footprint": gc_.utm_footprint,
                         }
                     except Exception as cell_exc:
-                        logger.error("cell_extract_failed", error=str(cell_exc), grid_cell=gc_.id())
+                        logger.error(
+                            "cell_extract_failed",
+                            error=str(cell_exc),
+                            grid_cell=gc_.id(),
+                        )
                         return None
 
                 max_cell_workers = extract_params.get("max_workers", 16)
@@ -613,10 +719,20 @@ class AwsGoesExtractor(Extractor, plugin_abstract=False):
         Example: ...OR_ABI-L1b-RadF-M6C01_G19... -> goes19_radf
         """
         name = Path(href).name.lower()
-        
+
         # Satellite
-        sat = "goes16" if "g16" in name else "goes17" if "g17" in name else "goes18" if "g18" in name else "goes19" if "g19" in name else "unknown"
-        
+        sat = (
+            "goes16"
+            if "g16" in name
+            else "goes17"
+            if "g17" in name
+            else "goes18"
+            if "g18" in name
+            else "goes19"
+            if "g19" in name
+            else "unknown"
+        )
+
         # Product/Domain
         if "radf" in name:
             prod = "radf"
@@ -626,7 +742,7 @@ class AwsGoesExtractor(Extractor, plugin_abstract=False):
             prod = "radm"
         else:
             prod = "unknown"
-            
+
         return f"{sat}_{prod}"
 
     @staticmethod
@@ -656,24 +772,42 @@ class AwsGoesExtractor(Extractor, plugin_abstract=False):
     def _read_abi_calibration_params(nc_path: str) -> dict[str, Any]:
         """Read ABI calibration constants from a GOES NetCDF file.
 
-        Returns a dict with keys needed for VIS reflectance and IR BT conversion:
-          - ``esun``        : band solar irradiance  (W m⁻² μm⁻¹)
-          - ``esd``         : earth-sun distance anomaly (AU)
-          - ``planck_fk1``  : Planck function constant 1 (IR only)
-          - ``planck_fk2``  : Planck function constant 2 (IR only)
-          - ``planck_bc1``  : Planck bias correction 1   (IR only)
-          - ``planck_bc2``  : Planck bias correction 2   (IR only)
+        Args:
+            nc_path: Path to the GOES .nc file.
+
+        Returns:
+            Dict with keys needed for VIS reflectance and IR BT conversion:
+                - esun: Band solar irradiance (W m^-2 um^-1).
+                - esd: Earth-sun distance anomaly (AU).
+                - planck_fk1: Planck function constant 1 (IR only).
+                - planck_fk2: Planck function constant 2 (IR only).
+                - planck_bc1: Planck bias correction 1 (IR only).
+                - planck_bc2: Planck bias correction 2 (IR only).
         """
         import xarray as xr
 
         # Strip the "netcdf:...:Rad" GDAL URI prefix if present
         clean_path = nc_path
-        if clean_path.startswith("netcdf:"):
-            clean_path = clean_path.split(":")[1]
+        if clean_path.lower().startswith("netcdf:"):
+            # Format is typically NETCDF:"/path/to/file.nc":Rad
+            parts = clean_path.split(":")
+            # If path has no colons inside, parts[1] is the quoted path.
+            # actually we can just strip prefix and suffix
+            clean_path = clean_path[7:]  # remove NETCDF:
+            if ":" in clean_path:
+                clean_path = clean_path.rsplit(":", 1)[0]  # remove :Rad
+            clean_path = clean_path.strip("\"'")
 
         ds = xr.open_dataset(clean_path, mask_and_scale=False)
         params: dict[str, Any] = {}
-        for key in ("esun", "earth_sun_distance_anomaly_in_AU", "planck_fk1", "planck_fk2", "planck_bc1", "planck_bc2"):
+        for key in (
+            "esun",
+            "earth_sun_distance_anomaly_in_AU",
+            "planck_fk1",
+            "planck_fk2",
+            "planck_bc1",
+            "planck_bc2",
+        ):
             if key in ds:
                 params[key] = float(ds[key].values)
         ds.close()
@@ -687,20 +821,18 @@ class AwsGoesExtractor(Extractor, plugin_abstract=False):
     ) -> np.ndarray:
         """Apply ABI radiometric calibration to a warped radiance array.
 
-        Parameters
-        ----------
-        data:
-            Float32 radiance array (already scale+offset applied by GDAL).
-        calibration:
-            ``'radiance'``               – no-op, return as-is.
-            ``'reflectance'``            – VIS calibration → TOA reflectance (%)
-                                           equivalent to Satpy's default for C01-C06.
-            ``'brightness_temperature'`` – IR Planck inversion → BT in Kelvin
-                                           equivalent to Satpy's default for C07-C16.
-        cal_params:
-            Dict from :meth:`_read_abi_calibration_params`.
+        Args:
+            data: Float32 radiance array (already scale+offset applied by GDAL).
+            calibration: Type of calibration to apply.
+                - 'radiance': No-op, return as-is.
+                - 'reflectance': VIS calibration -> TOA reflectance (%).
+                - 'brightness_temperature': IR Planck inversion -> BT in Kelvin.
+            cal_params: Dict from _read_abi_calibration_params.
+
+        Returns:
+            Calibrated array.
         """
-        if calibration == "radiance":
+        if calibration in ("radiance", "counts"):
             return data
 
         if calibration == "reflectance":
@@ -733,429 +865,6 @@ class AwsGoesExtractor(Extractor, plugin_abstract=False):
         raise ValueError(
             f"Unknown calibration '{calibration}'. Choose from: 'radiance', 'reflectance', 'brightness_temperature'."
         )
-
-    @staticmethod
-    def _get_goes_georef(nc_path: str) -> tuple[str, tuple[float, float, float, float, float, float], int, int]:
-        """Read GOES NetCDF georeferencing metadata.
-
-        Returns (crs_wkt, geotransform, width, height) with coordinates scaled to meters.
-        """
-        import xarray as xr
-
-        clean_path = nc_path
-        if clean_path.startswith("netcdf:") or clean_path.startswith("NETCDF:"):
-            clean_path = clean_path.split(":")[1].strip('"')
-            if ":" in clean_path:
-                clean_path = clean_path.split(":")[0]
-
-        ds = xr.open_dataset(clean_path)
-        x = ds["x"].values
-        y = ds["y"].values
-        ds.close()
-
-        h = 35786023.0
-        x_m = x * h
-        y_m = y * h
-
-        x_res = abs(x_m[1] - x_m[0]) if len(x_m) > 1 else abs(x_m[0])
-        y_res = abs(y_m[1] - y_m[0]) if len(y_m) > 1 else abs(y_m[0])
-
-        minx = x_m[0] - x_res / 2
-        miny = y_m[-1] - y_res / 2
-        maxx = x_m[-1] + x_res / 2
-        maxy = y_m[0] + y_res / 2
-
-        gt = (minx, x_res, 0.0, maxy, 0.0, -y_res)
-        width = len(x_m)
-        height = len(y_m)
-
-        crs_wkt = (
-            'PROJCS["GOES ABI Geostationary",'
-            'GEOGCS["GCS_WGS_1984",DATUM["D_WGS_1984",SPHEROID["WGS_1984",6378137.0,298.257223563]],'
-            'PRIMEM["Greenwich",0.0],UNIT["Degree",0.0174532925199433]],'
-            'PROJECTION["Geostationary_Satellite"],'
-            'PARAMETER["central_meridian",-75.0],'
-            'PARAMETER["satellite_height",35786023.0],'
-            'PARAMETER["false_easting",0.0],PARAMETER["false_northing",0.0],'
-            'UNIT["Meter",1.0]]'
-        )
-        return crs_wkt, gt, width, height
-
-    @staticmethod
-    def _warp_cell_gdal(
-        src_path: str,
-        dst_path: str,
-        dst_crs: str,
-        bounds: tuple[float, float, float, float],
-        width: int,
-        height: int,
-        calibration: str = "radiance",
-        cal_params: dict[str, Any] | None = None,
-    ) -> None:
-        """Warp a single grid cell using GDAL Warp (osgeo.gdal)."""
-        if gdal is None or osr is None:
-            raise ImportError("GDAL Python bindings (osgeo) not installed.")
-
-        import rasterio
-        from rasterio.crs import CRS as RioCRS
-
-        gdal.UseExceptions()
-
-        # 1. Get source CRS and Transform from NetCDF metadata
-        logger.debug("reading_goes_georef", path=src_path)
-        src_crs_wkt, src_gt, _, _ = AwsGoesExtractor._get_goes_georef(src_path)
-
-        # 2. Setup GDAL objects
-        minx, miny, maxx, maxy = bounds
-        if dst_crs.isdigit():
-            dst_crs = f"EPSG:{dst_crs}"
-
-        logger.debug("opening_src_gdal", path=src_path)
-        src_ds = gdal.Open(src_path, gdal.GA_ReadOnly)
-        if src_ds is None:
-            raise RuntimeError(f"Could not open {src_path} with GDAL")
-
-        # Create a memory VRT to override projection and geotransform
-        vrt_ds = gdal.BuildVRT("", src_ds)
-        vrt_ds.SetProjection(src_crs_wkt)
-        vrt_ds.SetGeoTransform(src_gt)
-
-        # 3. Perform Warp
-        logger.debug("starting_gdal_warp", dst_crs=dst_crs)
-        warp_ds = gdal.Warp(
-            "",
-            vrt_ds,
-            format="MEM",
-            dstSRS=dst_crs,
-            outputBounds=(minx, miny, maxx, maxy),
-            width=width,
-            height=height,
-            resampleAlg=gdal.GRA_NearestNeighbour,
-            multithread=False,
-        )
-        logger.debug("reading_warp_array")
-        dst_data = warp_ds.ReadAsArray()
-
-        # 4. Calibration
-        if calibration != "radiance" and cal_params:
-            dst_data = AwsGoesExtractor._apply_abi_calibration(dst_data, calibration, cal_params)
-
-        # 5. Write final GeoTIFF
-        from rasterio.transform import from_bounds
-
-        dst_transform = from_bounds(minx, miny, maxx, maxy, width, height)
-        profile = {
-            "driver": "GTiff",
-            "dtype": "float32",
-            "width": width,
-            "height": height,
-            "count": 1,
-            "crs": RioCRS.from_user_input(dst_crs),
-            "transform": dst_transform,
-            "compress": "deflate",
-            "predictor": 2,
-            "zlevel": 1,
-            "tiled": True,
-            "blockxsize": 512,
-            "blockysize": 512,
-        }
-        with rasterio.open(dst_path, "w", **profile) as dst:
-            if dst_data.ndim == 2:
-                dst.write(dst_data, 1)
-            else:
-                dst.write(dst_data)
-
-        # Cleanup GDAL objects
-        src_ds = None
-        vrt_ds = None
-        warp_ds = None
-
-    def _extract_gdal(
-        self,
-        extraction_task: ExtractionTask,
-        extract_params: dict[str, Any],
-    ) -> GeoDataFrame[ArtifactSchema]:
-        """Extract using GDAL Warp (osgeo.gdal) — fast multi-threaded warping."""
-        assets = extraction_task.assets
-        resolution = extraction_task.resolution
-        uri = extraction_task.uri
-        grid_cells = extraction_task.overlapping_grid_cells
-
-        first_row = assets.iloc[0]
-        href: str = first_row["href"]
-        granule_id: str = first_row.get("granule_id", Path(href).name)
-        channel_id: str | None = first_row.get("channel_id")
-        collection: str = first_row["collection"]
-        start_time = first_row["start_time"]
-        end_time = first_row["end_time"]
-        source_ids = ",".join(assets["id"].astype(str).tolist())
-
-        if channel_id is None:
-            raise ValueError(f"No channel_id in asset row for granule: {granule_id}")
-
-        # Download file from S3 (only if not cached)
-        local_dir = Path(uri).absolute()
-        local_dir.mkdir(parents=True, exist_ok=True)
-        local_path = local_dir / Path(href).name
-        if not local_path.exists():
-            fs = s3fs.S3FileSystem(anon=True)
-            s3_path = href.replace("s3://", "")
-            fs.get(s3_path, str(local_path))
-        logger.info("file_downloaded", local_path=str(local_path))
-
-        # Detect subdataset
-        src_path = self._detect_subdataset(str(local_path), channel_id)
-
-        # Calibration
-        calibration = extract_params.get("calibration", "radiance")
-        cal_params: dict[str, Any] = {}
-        if calibration != "radiance":
-            cal_params = self._read_abi_calibration_params(src_path)
-
-        artifact_rows: list[dict[str, Any]] = []
-        dataset_name = f"C{int(channel_id):02d}" if channel_id.isdigit() else channel_id
-
-        def _warp_one(gc_: GridCell) -> dict[str, Any] | None:
-            try:
-                area_def = gc_.area_def(int(resolution))
-                area_name = gc_.area_name(int(resolution))
-                ts = start_time.strftime("%Y%m%dT%H%M%S")
-                cal_suffix = "" if calibration == "radiance" else f"_{calibration[:3]}"
-                filename = f"{ts}_{collection}_{dataset_name}_{area_name}{cal_suffix}.tif"
-                output_path = local_dir / filename
-
-                if not output_path.exists():
-                    self._warp_cell_gdal(
-                        src_path=src_path,
-                        dst_path=str(output_path),
-                        dst_crs=area_def.projection,
-                        bounds=area_def.area_extent,
-                        width=area_def.width,
-                        height=area_def.height,
-                        calibration=calibration,
-                        cal_params=cal_params,
-                    )
-                    logger.info("cell_extracted", path=str(output_path), engine="gdal")
-
-                artifact_id = hashlib.md5(f"{granule_id}_{area_name}".encode()).hexdigest()
-                return {
-                    "id": artifact_id,
-                    "source_ids": source_ids,
-                    "start_time": start_time,
-                    "end_time": end_time,
-                    "uri": str(output_path),
-                    "geometry": gc_.geom,
-                    "collection": collection,
-                    "grid_cell": gc_.id(),
-                    "grid_dist": gc_.D,
-                    "cell_geometry": gc_.geom,
-                    "cell_utm_crs": str(gc_.utm_crs),
-                    "cell_utm_footprint": gc_.utm_footprint,
-                }
-            except Exception as exc:
-                logger.error("cell_extract_failed", error=str(exc), grid_cell=gc_.id(), engine="gdal")
-                return None
-
-        max_workers = extract_params.get("max_workers", 8)
-        if max_workers == 1:
-            for gc_ in grid_cells:
-                res = _warp_one(gc_)
-                if res:
-                    artifact_rows.append(res)
-        else:
-            with ThreadPoolExecutor(max_workers=max_workers) as pool:
-                futures = [pool.submit(_warp_one, gc_) for gc_ in grid_cells]
-                for fut in as_completed(futures):
-                    res = fut.result()
-                    if res:
-                        artifact_rows.append(res)
-
-        if not artifact_rows:
-            raise ValueError(f"All grid cells failed for granule: {granule_id}")
-
-        gdf = gpd.GeoDataFrame(artifact_rows, geometry="geometry")
-        return cast(GeoDataFrame[ArtifactSchema], ArtifactSchema.validate(gdf))
-
-    @staticmethod
-    def _warp_cell(
-        src_path: str,
-        dst_path: str,
-        dst_crs: str,
-        bounds: tuple[float, float, float, float],
-        width: int,
-        height: int,
-        calibration: str = "radiance",
-        cal_params: dict[str, Any] | None = None,
-    ) -> None:
-        """Warp a single grid cell from GOES geostationary to UTM using rasterio."""
-        import rasterio
-        from rasterio.crs import CRS as RioCRS
-        from rasterio.transform import from_bounds
-        from rasterio.warp import reproject, Resampling
-
-        if dst_crs.isdigit():
-            dst_crs = f"EPSG:{dst_crs}"
-
-        dst_crs_obj = RioCRS.from_user_input(dst_crs)
-        minx, miny, maxx, maxy = bounds
-        dst_transform = from_bounds(minx, miny, maxx, maxy, width, height)
-
-        # Read georeferencing from NetCDF metadata
-        src_crs_wkt, src_gt, src_width, src_height = AwsGoesExtractor._get_goes_georef(src_path)
-        src_crs = RioCRS.from_wkt(src_crs_wkt)
-        src_transform = rasterio.Affine(*src_gt[:6])
-
-        # Open the raw NetCDF (not the subdataset URI) to read the data array
-        clean_path = src_path
-        if clean_path.startswith("netcdf:") or clean_path.startswith("NETCDF:"):
-            clean_path = clean_path.split(":")[1].strip('"')
-            if ":" in clean_path:
-                clean_path = clean_path.split(":")[0]
-
-        with rasterio.open(clean_path) as src:
-            dst_data = np.empty((1, height, width), dtype=np.float32)
-
-            reproject(
-                source=rasterio.band(src, 1),
-                destination=dst_data[0],
-                src_transform=src_transform,
-                src_crs=src_crs,
-                dst_transform=dst_transform,
-                dst_crs=dst_crs_obj,
-                resampling=Resampling.nearest,
-                num_threads=2,
-            )
-
-        # Optional post-warp calibration (VIS reflectance or IR BT)
-        if calibration != "radiance" and cal_params:
-            dst_data[0] = AwsGoesExtractor._apply_abi_calibration(dst_data[0], calibration, cal_params)
-
-        # Write output GeoTIFF
-        profile = {
-            "driver": "GTiff",
-            "dtype": "float32",
-            "width": width,
-            "height": height,
-            "count": 1,
-            "crs": dst_crs_obj,
-            "transform": dst_transform,
-            "compress": "deflate",
-            "predictor": 2,
-            "zlevel": 1,
-            "tiled": True,
-            "blockxsize": 512,
-            "blockysize": 512,
-        }
-        with rasterio.open(dst_path, "w", **profile) as dst:
-            dst.write(dst_data)
-
-    def _extract_rasterio(
-        self,
-        extraction_task: ExtractionTask,
-        extract_params: dict[str, Any],
-    ) -> GeoDataFrame[ArtifactSchema]:
-        """Extract using rasterio.warp.reproject (GDAL warp) — one warp per cell."""
-        assets = extraction_task.assets
-        resolution = extraction_task.resolution
-        uri = extraction_task.uri
-        grid_cells = extraction_task.overlapping_grid_cells
-
-        first_row = assets.iloc[0]
-        href: str = first_row["href"]
-        granule_id: str = first_row.get("granule_id", Path(href).name)
-        channel_id: str | None = first_row.get("channel_id")
-        collection: str = first_row["collection"]
-        start_time = first_row["start_time"]
-        end_time = first_row["end_time"]
-        source_ids = ",".join(assets["id"].astype(str).tolist())
-
-        if channel_id is None:
-            raise ValueError(f"No channel_id in asset row for granule: {granule_id}")
-
-        # Download file from S3 (only if not cached)
-        local_dir = Path(uri).absolute()
-        local_dir.mkdir(parents=True, exist_ok=True)
-        local_path = local_dir / Path(href).name
-        if not local_path.exists():
-            fs = s3fs.S3FileSystem(anon=True)
-            s3_path = href.replace("s3://", "")
-            fs.get(s3_path, str(local_path))
-        logger.info("file_downloaded", local_path=str(local_path))
-
-        # Detect subdataset
-        src_path = self._detect_subdataset(str(local_path), channel_id)
-
-        # Calibration
-        calibration = extract_params.get("calibration", "radiance")
-        cal_params: dict[str, Any] = {}
-        if calibration != "radiance":
-            cal_params = self._read_abi_calibration_params(src_path)
-
-        artifact_rows: list[dict[str, Any]] = []
-        dataset_name = f"C{int(channel_id):02d}" if channel_id.isdigit() else channel_id
-
-        def _warp_one(gc_: GridCell) -> dict[str, Any] | None:
-            try:
-                area_def = gc_.area_def(int(resolution))
-                area_name = gc_.area_name(int(resolution))
-                ts = start_time.strftime("%Y%m%dT%H%M%S")
-                # Include calibration in filename so different calibrations don't clash
-                cal_suffix = "" if calibration == "radiance" else f"_{calibration[:3]}"
-                filename = f"{ts}_{collection}_{dataset_name}_{area_name}{cal_suffix}.tif"
-                output_path = local_dir / filename
-
-                if not output_path.exists():
-                    self._warp_cell(
-                        src_path=src_path,
-                        dst_path=str(output_path),
-                        dst_crs=area_def.projection,
-                        bounds=area_def.area_extent,
-                        width=area_def.width,
-                        height=area_def.height,
-                        calibration=calibration,
-                        cal_params=cal_params,
-                    )
-                    logger.info("cell_extracted", path=str(output_path), engine="rasterio")
-
-                artifact_id = hashlib.md5(f"{granule_id}_{area_name}".encode()).hexdigest()
-                return {
-                    "id": artifact_id,
-                    "source_ids": source_ids,
-                    "start_time": start_time,
-                    "end_time": end_time,
-                    "uri": str(output_path),
-                    "geometry": gc_.geom,
-                    "collection": collection,
-                    "grid_cell": gc_.id(),
-                    "grid_dist": gc_.D,
-                    "cell_geometry": gc_.geom,
-                    "cell_utm_crs": str(gc_.utm_crs),
-                    "cell_utm_footprint": gc_.utm_footprint,
-                }
-            except Exception as exc:
-                logger.error("cell_extract_failed", error=str(exc), grid_cell=gc_.id(), engine="rasterio")
-                return None
-
-        max_workers = extract_params.get("max_workers", 8)
-        if max_workers == 1:
-            for gc_ in grid_cells:
-                res = _warp_one(gc_)
-                if res:
-                    artifact_rows.append(res)
-        else:
-            with ThreadPoolExecutor(max_workers=max_workers) as pool:
-                futures = [pool.submit(_warp_one, gc_) for gc_ in grid_cells]
-                for fut in as_completed(futures):
-                    res = fut.result()
-                    if res:
-                        artifact_rows.append(res)
-
-        if not artifact_rows:
-            raise ValueError(f"All grid cells failed for granule: {granule_id}")
-
-        Path(local_path).unlink()
-        gdf = gpd.GeoDataFrame(artifact_rows, geometry="geometry")
-        return cast(GeoDataFrame[ArtifactSchema], ArtifactSchema.validate(gdf))
 
     @override
     def extract_batches(

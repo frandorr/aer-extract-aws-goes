@@ -1,3 +1,5 @@
+"""High-performance GOES data extraction using pre-computed LUTs."""
+
 from .core import (
     AwsGoesExtractor,
     detect_reader,

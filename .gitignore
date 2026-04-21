@@ -1,6 +1,7 @@
 profile*
 scalene*
-local
+local/
+luts
 .planning/
 ### Python ###
 # Byte-compiled / optimized / DLL files

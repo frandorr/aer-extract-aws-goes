@@ -9,7 +9,7 @@ This plugin implements the `AwsGoesExtractor` class which inherits from the `aer
 ### Key Features
 - **Automated Download**: Fetches NetCDF granules anonymously from AWS S3.
 - **satpy Integration**: Automatically detects and builds `satpy` Scenes (supports ABI-L1b and ABI-L2 collections).
-- **Grid Resampling**: Resamples data to predefined overlapping grid cells using LUT-cached nearest-neighbor interpolation.
+- **Grid Resampling**: Resamples data to predefined overlapping grid cells using LUT-cached nearest-neighbor interpolation with pixel-perfect numerical parity.
 - **GeoTIFF / NetCDF Saving**: Outputs standard artifacts that preserve geospatial metadata.
 - **Concurrent Batching**: Extracts grid cells in parallel across multiple worker threads and processes.
 
@@ -57,6 +57,7 @@ This plugin includes a high-performance extraction engine that uses pre-computed
 - **Zero Reprojection**: Uses pre-calculated nearest-neighbor indices stored in Zarr format.
 - **Lazy Loading**: Only the chunks of the LUT covering your specific Area of Interest (AOI) are loaded.
 - **Auto-Download**: If a LUT for a specific UTM Zone and resolution is missing locally, the plugin automatically fetches it from the GitHub Release assets.
+- **Scientific Parity**: Achieving identical results to Satpy's nearest-neighbor resampling through precision integer-based coordinate slicing.
 
 #### Usage
 To use the LUT engine, set the `engine` parameter to `"lut"`. You can optionally specify a `lut_dir` (defaults to `~/.cache/aer/extract-aws-goes/luts`).
@@ -67,7 +68,7 @@ artifacts_df = extractor.extract(
     task, 
     extract_params={
         "engine": "lut",
-        "calibration": "reflectance", # 'radiance' (default), 'reflectance', or 'brightness_temperature'
+        "calibration": "reflectance", # 'counts' (raw), 'radiance', 'reflectance', or 'brightness_temperature'
     }
 )
 ```
@@ -82,6 +83,10 @@ LUTs are stored as zipped Zarr files in GitHub Release assets. The plugin dynami
 This project uses a **Polylith** structure. Code is organized into:
 - **Components**: The core logic under `components/`.
 - **Projects**: Deployable packaging under `projects/`.
+
+## 📚 Documentation
+
+This project adheres to the **Google Docstring style guide**. All public APIs are documented with detailed `Args`, `Returns`, and `Raises` sections to ensure clarity and ease of use for integrated AI coding assistants.
 
 ## 📜 License
 

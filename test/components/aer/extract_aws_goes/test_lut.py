@@ -38,8 +38,8 @@ def test_extract_cell_from_lut_simple(tmp_path):
     valid_output = np.ones(100, dtype=bool)
     index_arr = np.arange(100, dtype=np.int32)
     
-    z.create_dataset("valid_output_index", data=valid_output, shape=(100,), dtype=bool)
-    z.create_dataset("index_array", data=index_arr, shape=(100,), dtype=np.int32)
+    z.create_array("valid_output_index", data=valid_output, shape=(100,), dtype=bool)
+    z.create_array("index_array", data=index_arr, shape=(100,), dtype=np.int32)
     
     source_data = np.arange(100, dtype=np.float32)
     

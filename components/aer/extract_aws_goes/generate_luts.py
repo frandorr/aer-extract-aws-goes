@@ -25,6 +25,7 @@ from aer.extract_aws_goes.lut import (
 )
 
 def main():
+    """Main entry point for the GOES LUT generator CLI."""
     parser = argparse.ArgumentParser(description="Generate GOES→UTM zone lookup tables")
     parser.add_argument("--goes-file", required=True, help="Path to a GOES NetCDF file")
     parser.add_argument("--output-dir", required=True, help="Output directory for LUT Zarr stores")
