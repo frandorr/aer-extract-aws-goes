@@ -99,7 +99,6 @@ dependencies = [
 [package.dev-dependencies]
 dev = [
     { name = "aer-extract-aws-goes" },
-    { name = "aer-search-aws-goes" },
     { name = "ipykernel" },
     { name = "jupyter" },
     { name = "line-profiler" },
@@ -129,7 +128,6 @@ requires-dist = [
 [package.metadata.requires-dev]
 dev = [
     { name = "aer-extract-aws-goes", editable = "projects/aer-extract-aws-goes" },
-    { name = "aer-search-aws-goes", editable = "../aer-search-aws-goes/projects/aer-search-aws-goes" },
     { name = "ipykernel", specifier = ">=7.2.0" },
     { name = "jupyter", specifier = ">=1.1.1" },
     { name = "line-profiler", specifier = ">=5.0.2" },
@@ -139,25 +137,6 @@ dev = [
     { name = "pytest", specifier = ">=9.0.2,<10.0.0" },
     { name = "python-semantic-release", specifier = ">=10.5.3,<11.0.0" },
     { name = "scalene", specifier = ">=2.2.1" },
-]
-
-[[package]]
-name = "aer-search-aws-goes"
-version = "2.4.1"
-source = { editable = "../aer-search-aws-goes/projects/aer-search-aws-goes" }
-dependencies = [
-    { name = "aer-core" },
-    { name = "geopandas" },
-    { name = "pandera", extra = ["geopandas"] },
-    { name = "s3fs" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "aer-core", editable = "../aer/projects/aer-core" },
-    { name = "geopandas", specifier = ">=1.1.2,<2.0.0" },
-    { name = "pandera", extras = ["geopandas"], specifier = ">=0.24.0,<0.25.0" },
-    { name = "s3fs", specifier = ">=2026.2.0,<2027.0.0" },
 ]
 
 [[package]]
