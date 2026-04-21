@@ -252,10 +252,10 @@ class AwsGoesExtractor(Extractor, plugin_abstract=False):
             calibration (str): 'radiance', 'reflectance', or 'brightness_temperature' (default: 'radiance')
             max_workers (int): Thread pool workers for parallel cell extraction (default: 16)
         """
+        from aer.extract_aws_goes.lut import get_default_lut_dir
+
         lut_dir_str = extract_params.get("lut_dir")
-        if not lut_dir_str:
-            raise ValueError("engine='lut' requires extract_params['lut_dir'] pointing to the LUT directory")
-        lut_dir = Path(lut_dir_str)
+        lut_dir = Path(lut_dir_str) if lut_dir_str else get_default_lut_dir()
 
         assets = extraction_task.assets
         resolution = extraction_task.resolution
@@ -312,8 +312,13 @@ class AwsGoesExtractor(Extractor, plugin_abstract=False):
 
         for utm_epsg, group_cells in utm_groups.items():
             try:
-                # Load UTM zone LUT (lazy Zarr group)
-                lut_info, lut_group = load_utm_zone_lut(lut_dir, utm_epsg, int(resolution))
+                # Detect combo (e.g. goes19_radf) for auto-download
+                combo = self._detect_combo(href)
+
+                # Load UTM zone LUT (lazy Zarr group, with auto-download if missing)
+                lut_info, lut_group = load_utm_zone_lut(
+                    lut_dir, utm_epsg, int(resolution), combo=combo, auto_download=True
+                )
                 lut_extent = lut_info.area_extent
                 lut_height = lut_info.height
                 lut_width = lut_info.width
@@ -599,7 +604,30 @@ class AwsGoesExtractor(Extractor, plugin_abstract=False):
         validated = ArtifactSchema.validate(gdf)
         return cast(GeoDataFrame[ArtifactSchema], validated)
 
-    # ── rasterio/GDAL warp-based extraction ───────────────────────────────
+    # ── Helpers ───────────────────────────────
+
+    @staticmethod
+    def _detect_combo(href: str) -> str:
+        """Detect the satellite/product combo from a GOES filename.
+
+        Example: ...OR_ABI-L1b-RadF-M6C01_G19... -> goes19_radf
+        """
+        name = Path(href).name.lower()
+        
+        # Satellite
+        sat = "goes16" if "g16" in name else "goes17" if "g17" in name else "goes18" if "g18" in name else "goes19" if "g19" in name else "unknown"
+        
+        # Product/Domain
+        if "radf" in name:
+            prod = "radf"
+        elif "radc" in name:
+            prod = "radc"
+        elif "radm" in name:
+            prod = "radm"
+        else:
+            prod = "unknown"
+            
+        return f"{sat}_{prod}"
 
     @staticmethod
     def _detect_subdataset(nc_path: str, channel_id: str) -> str:

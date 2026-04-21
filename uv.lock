@@ -20,17 +20,16 @@ members = [
 
 [[package]]
 name = "aer-core"
-version = "3.5.0"
+version = "5.0.1"
 source = { editable = "../aer/projects/aer-core" }
 dependencies = [
     { name = "attrs" },
+    { name = "cattrs" },
     { name = "geopandas" },
+    { name = "majortom-eg" },
     { name = "pandas" },
     { name = "pandera", extra = ["geopandas"] },
-    { name = "pydantic-settings" },
     { name = "pyproj" },
-    { name = "pyresample" },
-    { name = "pyyaml" },
     { name = "shapely" },
     { name = "structlog" },
     { name = "utm" },
@@ -39,13 +38,12 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "attrs", specifier = ">=25.4" },
+    { name = "cattrs", specifier = ">=24.1" },
     { name = "geopandas", specifier = ">=1.1.2" },
+    { name = "majortom-eg" },
     { name = "pandas", specifier = ">=3.0.1" },
     { name = "pandera", extras = ["geopandas"], specifier = ">=0.24" },
-    { name = "pydantic-settings", specifier = ">=2.13.1" },
     { name = "pyproj", specifier = ">=3.7.1" },
-    { name = "pyresample", specifier = ">=1.35" },
-    { name = "pyyaml", specifier = ">=6.0.1" },
     { name = "shapely", specifier = ">=2.1.2" },
     { name = "structlog", specifier = ">=25.5" },
     { name = "utm", specifier = ">=0.8.1" },
@@ -53,7 +51,7 @@ requires-dist = [
 
 [[package]]
 name = "aer-extract-aws-goes"
-version = "1.3.0"
+version = "1.4.0"
 source = { editable = "projects/aer-extract-aws-goes" }
 dependencies = [
     { name = "aer-core" },
@@ -62,6 +60,7 @@ dependencies = [
     { name = "pyresample" },
     { name = "rasterio" },
     { name = "rioxarray" },
+    { name = "s3fs" },
     { name = "satpy" },
     { name = "xarray" },
 ]
@@ -74,6 +73,7 @@ requires-dist = [
     { name = "pyresample", specifier = ">=1.35.0" },
     { name = "rasterio", specifier = ">=1.5.0" },
     { name = "rioxarray", specifier = ">=0.22.0" },
+    { name = "s3fs", specifier = ">=2025.2" },
     { name = "satpy", specifier = ">=0.60.0" },
     { name = "xarray", specifier = ">=2026.2.0" },
 ]
@@ -84,13 +84,16 @@ version = "1.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "aer-core" },
+    { name = "gdal" },
     { name = "h5netcdf", extra = ["h5py"] },
     { name = "netcdf4" },
+    { name = "pyproj" },
     { name = "pyresample" },
     { name = "rasterio" },
     { name = "rioxarray" },
     { name = "satpy" },
     { name = "xarray" },
+    { name = "zarr" },
 ]
 
 [package.dev-dependencies]
@@ -111,13 +114,16 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "aer-core", editable = "../aer/projects/aer-core" },
+    { name = "gdal", specifier = "==3.10.3" },
     { name = "h5netcdf", extras = ["h5py"], specifier = ">=1.8.1" },
     { name = "netcdf4", specifier = ">=1.7.4" },
+    { name = "pyproj", specifier = ">=3.6.0" },
     { name = "pyresample", specifier = ">=1.35.0" },
     { name = "rasterio", specifier = ">=1.5.0" },
     { name = "rioxarray", specifier = ">=0.22.0" },
     { name = "satpy", specifier = ">=0.60.0" },
     { name = "xarray", specifier = ">=2026.2.0" },
+    { name = "zarr", specifier = ">=2.18.0" },
 ]
 
 [package.metadata.requires-dev]
@@ -137,7 +143,7 @@ dev = [
 
 [[package]]
 name = "aer-search-aws-goes"
-version = "2.4.0"
+version = "2.4.1"
 source = { editable = "../aer-search-aws-goes/projects/aer-search-aws-goes" }
 dependencies = [
     { name = "aer-core" },
@@ -452,6 +458,19 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/66/54/b80e1fcee4f732e0e9314bbb8679be9d5690caa1566c4a4cd14e9724d2dd/botocore-1.42.70.tar.gz", hash = "sha256:9ee17553b7febd1a0c1253b3b62ab5d79607eb6163c8fb943470a8893c31d4fa", size = 14997068, upload-time = "2026-03-17T19:43:10.678Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/fb/51/08f32aea872253173f513ba68122f4300966290677c8e59887b4ffd5d957/botocore-1.42.70-py3-none-any.whl", hash = "sha256:54ed9d25f05f810efd22b0dfda0bb9178df3ad8952b2e4359e05156c9321bd3c", size = 14671393, upload-time = "2026-03-17T19:43:06.777Z" },
+]
+
+[[package]]
+name = "cattrs"
+version = "26.1.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "attrs" },
+    { name = "typing-extensions" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/a0/ec/ba18945e7d6e55a58364d9fb2e46049c1c2998b3d805f19b703f14e81057/cattrs-26.1.0.tar.gz", hash = "sha256:fa239e0f0ec0715ba34852ce813986dfed1e12117e209b816ab87401271cdd40", size = 495672, upload-time = "2026-02-18T22:15:19.406Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/80/56/60547f7801b97c67e97491dc3d9ade9fbccbd0325058fd3dfcb2f5d98d90/cattrs-26.1.0-py3-none-any.whl", hash = "sha256:d1e0804c42639494d469d08d4f26d6b9de9b8ab26b446db7b5f8c2e97f7c3096", size = 73054, upload-time = "2026-02-18T22:15:17.958Z" },
 ]
 
 [[package]]
@@ -972,6 +991,33 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/51/7c/f60c259dcbf4f0c47cc4ddb8f7720d2dcdc8888c8e5ad84c73ea4531cc5b/fsspec-2026.2.0.tar.gz", hash = "sha256:6544e34b16869f5aacd5b90bdf1a71acb37792ea3ddf6125ee69a22a53fb8bff", size = 313441, upload-time = "2026-02-05T21:50:53.743Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/e6/ab/fb21f4c939bb440104cc2b396d3be1d9b7a9fd3c6c2a53d98c45b3d7c954/fsspec-2026.2.0-py3-none-any.whl", hash = "sha256:98de475b5cb3bd66bedd5c4679e87b4fdfe1a3bf4d707b151b3c07e58c9a2437", size = 202505, upload-time = "2026-02-05T21:50:51.819Z" },
+]
+
+[[package]]
+name = "future"
+version = "1.0.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/a7/b2/4140c69c6a66432916b26158687e821ba631a4c9273c474343badf84d3ba/future-1.0.0.tar.gz", hash = "sha256:bd2968309307861edae1458a4f8a4f3598c03be43b97521076aebf5d94c07b05", size = 1228490, upload-time = "2024-02-21T11:52:38.461Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/da/71/ae30dadffc90b9006d77af76b393cb9dfbfc9629f339fc1574a1c52e6806/future-1.0.0-py3-none-any.whl", hash = "sha256:929292d34f5872e70396626ef385ec22355a1fae8ad29e1a734c3e43f9fbc216", size = 491326, upload-time = "2024-02-21T11:52:35.956Z" },
+]
+
+[[package]]
+name = "gdal"
+version = "3.10.3"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/06/f9/a9a9496c8dc558c4c16a0c53283501fe3098b26536d5f475d378c8ed3437/gdal-3.10.3.tar.gz", hash = "sha256:b5550650daeeae8e41091581d9aea7d75a9f15b0ebbeb8c96e37458fa02264cd", size = 838170, upload-time = "2025-04-07T09:57:20.729Z" }
+
+[[package]]
+name = "geolib"
+version = "1.0.7"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "future" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/c6/df/0d7bac8eadd310b9ea92b8bdb0b9b879a8567370859bf42e15a6b435ec31/geolib-1.0.7.tar.gz", hash = "sha256:5d617fafbf337d333dc65b893b1893a664ca0383e3e4143932009761cf25962f", size = 4228, upload-time = "2019-05-04T22:20:18.892Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/f2/46/e08d831615af9670819432f84f63e30f65fdd4b9976faa093998e0af43ad/geolib-1.0.7-py3-none-any.whl", hash = "sha256:88a6b70dbcae49c51aa417e50d07e871d09e342c6bd060d88a76c921fcb34a75", size = 5538, upload-time = "2019-05-04T22:20:17.37Z" },
 ]
 
 [[package]]
@@ -1697,6 +1743,20 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/41/30/c640ccd3e570b08770a9f459decc2d8e7ceefdc34ac28a745418fb9cb5ba/loro-1.10.3-cp314-cp314t-musllinux_1_2_armv7l.whl", hash = "sha256:86d4f0c631ca274ad2fa2c0bdb8e1e141882d94339b7284a8bef5bf73fa6957d", size = 3599851, upload-time = "2025-12-09T10:12:31.759Z" },
     { url = "https://files.pythonhosted.org/packages/59/8f/062ea50554c47ae30e98b1f0442a458c0edecc6d4edc7fcfc4d901734dd0/loro-1.10.3-cp314-cp314t-musllinux_1_2_i686.whl", hash = "sha256:15e03084ff1b472e14623183ed6e1e43e0f717c2112697beda5e69b5bd0ff236", size = 3655558, upload-time = "2025-12-09T10:13:06.529Z" },
     { url = "https://files.pythonhosted.org/packages/f3/f5/c7dd8cdbd57454b23d89799c22cd42b6d2dda283cd87d7b198dc424a462c/loro-1.10.3-cp314-cp314t-musllinux_1_2_x86_64.whl", hash = "sha256:42d6a5ce5bc518eaa682413e82d597299650eeb03e8bc39341752d6e0d22503e", size = 3541282, upload-time = "2025-12-09T10:13:42.189Z" },
+]
+
+[[package]]
+name = "majortom-eg"
+version = "1.0.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "geolib" },
+    { name = "numpy" },
+    { name = "shapely" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/31/2f/eb58a838858f42b103728b4232004c571aac347f11f4e40f175ecc62ab64/majortom_eg-1.0.0.tar.gz", hash = "sha256:31e8a6f9f77f62e0f2d395ac8662ff4d62668ce01683e136e4fcede4f1560019", size = 44660, upload-time = "2026-03-20T16:56:46.845Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/6b/38/834e1342109f484fccad8f55d6a6980177a5ea009e5456087caaa588695e/majortom_eg-1.0.0-py3-none-any.whl", hash = "sha256:26086f9b11f21a833af77990d20f455986a7ad288aa99d11a804141b06f5b4f9", size = 4738, upload-time = "2026-03-20T16:56:45.172Z" },
 ]
 
 [[package]]
@@ -2655,20 +2715,6 @@ wheels = [
 ]
 
 [[package]]
-name = "pydantic-settings"
-version = "2.13.1"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "pydantic" },
-    { name = "python-dotenv" },
-    { name = "typing-inspection" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/52/6d/fffca34caecc4a3f97bda81b2098da5e8ab7efc9a66e819074a11955d87e/pydantic_settings-2.13.1.tar.gz", hash = "sha256:b4c11847b15237fb0171e1462bf540e294affb9b86db4d9aa5c01730bdbe4025", size = 223826, upload-time = "2026-02-19T13:45:08.055Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/00/4b/ccc026168948fec4f7555b9164c724cf4125eac006e176541483d2c959be/pydantic_settings-2.13.1-py3-none-any.whl", hash = "sha256:d56fd801823dbeae7f0975e1f8c8e25c258eb75d278ea7abb5d9cebb01b56237", size = 58929, upload-time = "2026-02-19T13:45:06.034Z" },
-]
-
-[[package]]
 name = "pygments"
 version = "2.19.2"
 source = { registry = "https://pypi.org/simple" }
@@ -2900,15 +2946,6 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/66/c0/0c8b6ad9f17a802ee498c46e004a0eb49bc148f2fd230864601a86dcf6db/python-dateutil-2.9.0.post0.tar.gz", hash = "sha256:37dd54208da7e1cd875388217d5e00ebd4179249f90fb72437e91a35459a0ad3", size = 342432, upload-time = "2024-03-01T18:36:20.211Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/ec/57/56b9bcc3c9c6a792fcbaf139543cee77261f3651ca9da0c93f5c1221264b/python_dateutil-2.9.0.post0-py2.py3-none-any.whl", hash = "sha256:a8b2bc7bffae282281c8140a97d3aa9c14da0b136dfe83f850eea9a5f7470427", size = 229892, upload-time = "2024-03-01T18:36:18.57Z" },
-]
-
-[[package]]
-name = "python-dotenv"
-version = "1.2.2"
-source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/82/ed/0301aeeac3e5353ef3d94b6ec08bbcabd04a72018415dcb29e588514bba8/python_dotenv-1.2.2.tar.gz", hash = "sha256:2c371a91fbd7ba082c2c1dc1f8bf89ca22564a087c2c287cd9b662adde799cf3", size = 50135, upload-time = "2026-03-01T16:00:26.196Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/0b/d7/1959b9648791274998a9c3526f6d0ec8fd2233e4d4acce81bbae76b44b2a/python_dotenv-1.2.2-py3-none-any.whl", hash = "sha256:1d8214789a24de455a8b8bd8ae6fe3c6b69a5e3d64aa8a8e5d68e694bbcb285a", size = 22101, upload-time = "2026-03-01T16:00:25.09Z" },
 ]
 
 [[package]]

@@ -49,6 +49,32 @@ tasks = extractor.prepare_for_extraction(
 artifacts_df = extractor.extract_batches(tasks, extract_params={"max_workers": 8})
 ```
 
+### 🚅 High-Performance LUT Engine
+
+This plugin includes a high-performance extraction engine that uses pre-computed **Look-Up Tables (LUTs)** to achieve near-zero projection overhead during extraction.
+
+#### Features
+- **Zero Reprojection**: Uses pre-calculated nearest-neighbor indices stored in Zarr format.
+- **Lazy Loading**: Only the chunks of the LUT covering your specific Area of Interest (AOI) are loaded.
+- **Auto-Download**: If a LUT for a specific UTM Zone and resolution is missing locally, the plugin automatically fetches it from the GitHub Release assets.
+
+#### Usage
+To use the LUT engine, set the `engine` parameter to `"lut"`. You can optionally specify a `lut_dir` (defaults to `~/.cache/aer/extract-aws-goes/luts`).
+
+```python
+# Extract using the LUT engine
+artifacts_df = extractor.extract(
+    task, 
+    extract_params={
+        "engine": "lut",
+        "calibration": "reflectance", # 'radiance' (default), 'reflectance', or 'brightness_temperature'
+    }
+)
+```
+
+#### LUT Distribution
+LUTs are stored as zipped Zarr files in GitHub Release assets. The plugin dynamically detects the satellite/product combination (e.g., `goes19_radf`) and download the appropriate LUT for the UTM zone of your grid cells.
+
 ---
 
 ## 🏗️ Architecture

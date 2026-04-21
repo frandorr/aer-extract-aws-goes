@@ -47,8 +47,8 @@ def main():
     # Setup: create grid cells over a test area
     grid = GridDefinition(d=100_000)
     poly = Polygon([(-102, 18), (-98, 18), (-98, 22), (-102, 22), (-102, 18)])
-    spatial_extent = grid.intersecting_grid_spatial_extent(poly)
-    grid_cells = sorted(list(spatial_extent.grid_cells), key=lambda g: g.area_name(args.resolution))[:args.num_cells]
+    overlapping_cells = grid.generate_grid_cells(poly)
+    grid_cells = sorted(list(overlapping_cells), key=lambda g: g.area_name(args.resolution))[:args.num_cells]
 
     print(f"Benchmarking {len(grid_cells)} grid cells at {args.resolution}m resolution")
     print(f"GOES file: {args.goes_file}")
@@ -56,23 +56,61 @@ def main():
     print()
 
     from aer.extract_aws_goes.core import AwsGoesExtractor
+    import pandas as pd
+    from aer.interfaces import ExtractionTask
 
     extractor = AwsGoesExtractor(target_grid_d=100_000)
 
-    # Note: This benchmark requires pre-generated LUTs.
-    # Run generate_luts.py first to create them.
+    # Build dummy asset
+    assets = pd.DataFrame([{
+        "id": "bench_item",
+        "href": args.goes_file,
+        "granule_id": Path(args.goes_file).name,
+        "channel_id": "01",
+        "collection": "goes-16-abi-l1b-radf",
+        "start_time": pd.Timestamp.now(),
+        "end_time": pd.Timestamp.now()
+    }])
+
+    import geopandas as gpd
+    assets_gdf = gpd.GeoDataFrame(assets, geometry=[poly])
+
+    task_dir = Path("development/local/benchmark_tmp").absolute()
+    task_dir.mkdir(parents=True, exist_ok=True)
+    import shutil
+    
+    task = ExtractionTask(
+        assets=assets_gdf,
+        target_grid_d=100_000,
+        target_grid_overlap=False,
+        resolution=args.resolution,
+        uri=str(task_dir),
+        aoi=poly,
+        task_context={}
+    )
 
     print("=" * 60)
     print("Results:")
     print(f"{'Engine':<15} {'Time (s)':<12} {'Cells':<8} {'ms/cell':<10}")
     print("-" * 60)
 
-    # Run rasterio benchmark
-    # (Implementation depends on having an ExtractionTask — adapt as needed)
-    print("NOTE: Full benchmark requires ExtractionTask setup.")
-    print("Use this script as a template and adapt to your specific test setup.")
-    print("=" * 60)
+    def run_benchmark(engine, label):
+        # Setup file to bypass download
+        target_file = task_dir / Path(args.goes_file).name
+        shutil.copy(args.goes_file, target_file)
+        
+        params = {"engine": engine, "lut_dir": args.lut_dir} if engine == "lut" else {"engine": engine}
+        t0 = time.perf_counter()
+        result = extractor.extract(task, params)
+        elapsed = time.perf_counter() - t0
+        
+        cells = len(result)
+        ms_per_cell = (elapsed / cells * 1000) if cells > 0 else 0
+        print(f"{label:<15} {elapsed:<12.2f} {cells:<8} {ms_per_cell:<10.1f}")
 
+    # run_benchmark("rasterio", "rasterio")
+    run_benchmark("lut", "lut")
+    print("=" * 60)
 
 if __name__ == "__main__":
     main()
