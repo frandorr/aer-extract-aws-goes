@@ -74,7 +74,16 @@ artifacts_df = extractor.extract(
 ```
 
 #### LUT Distribution
-LUTs are stored as zipped Zarr files in GitHub Release assets. The plugin dynamically detects the satellite/product combination (e.g., `goes19_radf`) and download the appropriate LUT for the UTM zone of your grid cells.
+LUTs are organized as zipped Zarr directories and published as assets in the GitHub Releases. 
+
+By default, **the plugin handles everything automatically**. When you request an extraction, it dynamically identifies the satellite and product combination (e.g., `goes19_radf`), checks if you have the required LUT locally, and downloads the ZIP from the latest GitHub release if missing. It extracts the files directly to your cache directory (default `~/.cache/aer/extract-aws-goes/luts`).
+
+**Offline Environments / Manual Setup:**
+If you are running the extractor in an air-gapped environment or want to pre-seed your cache:
+1. Navigate to the [Releases page](https://github.com/frandorr/aer-extract-aws-goes/releases) and download the required ZIP files (e.g., `goes19_radf_32720_1000m.zarr.zip`).
+2. Unzip the contents into your `lut_dir`. The structure must match: `<lut_dir>/<combo>/<utm_epsg>/<resolution>m.zarr`. 
+   *(Example: `~/.cache/aer/extract-aws-goes/luts/goes19_radf/32720/1000m.zarr`)*
+3. Run your extraction. The system will detect the local directory and skip the download.
 
 ---
 
