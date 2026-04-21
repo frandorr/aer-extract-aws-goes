@@ -21,6 +21,6 @@
 ## UTM Zone LUT Extraction (REQ-08)
 - [x] **REQ-08.1**: Offline LUT generator that computes GOES→UTM reprojection indices per UTM zone at configurable resolutions (500m, 1000m, 2000m).
 - [x] **REQ-08.2**: LUT storage in a chunked, fast-access format (Zarr) that supports lazy loading of specific UTM zones without loading the entire dataset.
-- [ ] **REQ-08.3**: New extraction engine (`engine="lut"`) that, given a grid_cell, loads the corresponding UTM zone LUT and extracts data via array index slicing — no runtime reprojection.
+- [x] **REQ-08.3**: New extraction engine (`engine="lut"`) that, given a grid_cell, loads the corresponding UTM zone LUT and extracts data via array index slicing — no runtime reprojection.
 - [x] **REQ-08.4**: Multi-resolution support: LUTs must be generated and loadable for 500m, 1000m, and 2000m target resolutions.
 
