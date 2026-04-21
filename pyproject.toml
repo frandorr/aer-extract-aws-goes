@@ -14,11 +14,14 @@ dependencies = [
     "aer-core",
     "h5netcdf[h5py]>=1.8.1",
     "netcdf4>=1.7.4",
+    "pyproj>=3.6.0",
     "pyresample>=1.35.0",
     "rasterio>=1.5.0",
+    "gdal==3.10.3",
     "rioxarray>=0.22.0",
     "satpy>=0.60.0",
     "xarray>=2026.2.0",
+    "zarr>=2.18.0",
 ]
 
 

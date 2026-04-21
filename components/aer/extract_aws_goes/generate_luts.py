@@ -16,7 +16,7 @@ import logging
 import time
 from pathlib import Path
 
-from aer.extract_aws_goes.core import detect_reader
+
 from aer.extract_aws_goes.lut import (
     SUPPORTED_RESOLUTIONS,
     compute_goes_source_area_def,
