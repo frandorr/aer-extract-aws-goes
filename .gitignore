@@ -196,3 +196,4 @@ docs/.obsidian/plugins/
 docs/.obsidian/graph.json
 
 *.bak
+.vscode/
