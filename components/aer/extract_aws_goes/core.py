@@ -392,7 +392,6 @@ class AwsGoesExtractor(Extractor, plugin_abstract=False):
                             lut_group,
                             row_sl,
                             col_sl,
-                            lut_height,
                             lut_width,
                         )
 
@@ -403,9 +402,22 @@ class AwsGoesExtractor(Extractor, plugin_abstract=False):
                         # Save as GeoTIFF — use the LUT-grid-aligned extent so
                         # pixel values and geospatial coordinates are consistent.
                         area_name = gc_.area_name(int(resolution))
-                        ts = start_time.strftime("%Y%m%dT%H%M%S")
-                        filename = f"{ts}_{collection}_{dataset_name}_{area_name}.tif"
-                        output_path = local_dir / filename
+                        
+                        combo_parts = AwsGoesExtractor._detect_combo(href).split("_")
+                        eoids_sat = f"{combo_parts[0]}_{combo_parts[1]}" if len(combo_parts) >= 2 else "unknown"
+                        eoids_prod = collection.split("-")[-1]
+                        
+                        from aer.eoids import build_eoids_path
+                        output_path = build_eoids_path(
+                            local_dir=local_dir,
+                            cell_id=gc_.id(),
+                            start_time=start_time,
+                            end_time=end_time,
+                            satellite=eoids_sat,
+                            product=eoids_prod,
+                            band=dataset_name,
+                            resolution=int(resolution),
+                        )
 
                         if not output_path.exists():
                             import rasterio
@@ -609,9 +621,22 @@ class AwsGoesExtractor(Extractor, plugin_abstract=False):
                 def _extract_cell(gc_: GridCell) -> dict[str, Any] | None:
                     try:
                         area_name = gc_.area_name(int(resolution))
-                        ts = start_time.strftime("%Y%m%dT%H%M%S")
-                        filename = f"{ts}_{collection}_{dataset_name}_{area_name}.tif"
-                        output_path = local_dir / filename
+                        
+                        combo_parts = AwsGoesExtractor._detect_combo(href).split("_")
+                        eoids_sat = f"{combo_parts[0]}_{combo_parts[1]}" if len(combo_parts) >= 2 else "unknown"
+                        eoids_prod = collection.split("-")[-1]
+                        
+                        from aer.eoids import build_eoids_path
+                        output_path = build_eoids_path(
+                            local_dir=local_dir,
+                            cell_id=gc_.id(),
+                            start_time=start_time,
+                            end_time=end_time,
+                            satellite=eoids_sat,
+                            product=eoids_prod,
+                            band=dataset_name,
+                            resolution=int(resolution),
+                        )
 
                         if output_path.exists():
                             logger.info("output_exists", path=str(output_path))
@@ -716,22 +741,23 @@ class AwsGoesExtractor(Extractor, plugin_abstract=False):
     def _detect_combo(href: str) -> str:
         """Detect the satellite/product combo from a GOES filename.
 
-        Example: ...OR_ABI-L1b-RadF-M6C01_G19... -> goes19_radf
+        Uses orbital-position-based naming so satellites at the same position
+        (and therefore with identical geostationary area definitions) share LUTs:
+          - GOES-16 and GOES-19 → ``goes_east``  (75.2 °W)
+          - GOES-17 and GOES-18 → ``goes_west``  (137.2 °W)
+
+        Example: ...OR_ABI-L1b-RadF-M6C01_G19... → goes_east_radf
         """
         name = Path(href).name.lower()
 
-        # Satellite
-        sat = (
-            "goes16"
-            if "g16" in name
-            else "goes17"
-            if "g17" in name
-            else "goes18"
-            if "g18" in name
-            else "goes19"
-            if "g19" in name
-            else "unknown"
-        )
+        # Map satellite number → orbital position.
+        # GOES-16/19 are at the East slot; GOES-17/18 are at the West slot.
+        if "g16" in name or "g19" in name:
+            sat = "goes_east"
+        elif "g17" in name or "g18" in name:
+            sat = "goes_west"
+        else:
+            sat = "unknown"
 
         # Product/Domain
         if "radf" in name:
