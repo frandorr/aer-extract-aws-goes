@@ -276,10 +276,9 @@ class AwsGoesExtractor(Extractor, plugin_abstract=False):
         Returns:
             GeoDataFrame containing references to extracted artifacts.
         """
-        from aer.extract_aws_goes.lut import get_default_lut_dir
+        from aer.extract_aws_goes.lut import get_default_bucket_uri
 
-        lut_dir_str = extract_params.get("lut_dir")
-        lut_dir = Path(lut_dir_str) if lut_dir_str else get_default_lut_dir()
+        bucket_uri = extract_params.get("bucket_uri", get_default_bucket_uri())
 
         assets = extraction_task.assets
         resolution = extraction_task.resolution
@@ -340,12 +339,11 @@ class AwsGoesExtractor(Extractor, plugin_abstract=False):
                 # Detect combo (e.g. goes19_radf) for auto-download
                 combo = self._detect_combo(href)
 
-                # Load UTM zone LUT (lazy Zarr group, with auto-download if missing)
+                # Load UTM zone LUT (lazy Zarr group, mapping from bucket)
                 lut_info, lut_group = load_utm_zone_lut(
-                    lut_dir, utm_epsg, int(resolution), combo=combo, auto_download=True
+                    bucket_uri, utm_epsg, int(resolution), combo=combo
                 )
                 lut_extent = lut_info.area_extent
-                lut_height = lut_info.height
                 lut_width = lut_info.width
 
                 # Compute the minimal crop of the GOES source needed for this UTM zone

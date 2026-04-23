@@ -7,10 +7,7 @@ from typing import Any, cast
 import attrs
 import numpy as np
 import pyproj
-import shutil
-import urllib.request
-import zipfile
-import importlib.metadata
+import fsspec
 import zarr
 from pyresample.geometry import AreaDefinition
 from pyresample.kd_tree import get_neighbour_info
@@ -19,22 +16,9 @@ SUPPORTED_RESOLUTIONS = (500, 1000, 2000)
 DEFAULT_RADIUS_OF_INFLUENCE = 50_000  # meters, for pyresample kd-tree search
 
 
-def get_package_version() -> str:
-    """Return the version of the aer-extract-aws-goes package."""
-    try:
-        # Standard way for installed pip packages
-        return importlib.metadata.version("aer-extract-aws-goes")
-    except importlib.metadata.PackageNotFoundError:
-        # Fallback for development/uninstalled mode
-        return "1.1.0"
-
-
-def get_default_lut_release_url() -> str:
-    """Return the GitHub Release URL for the current package version."""
-    version = get_package_version()
-    # Normalize version: ensure it starts with 'v' if needed, though releases usually use v1.1.0
-    v_tag = f"v{version}" if not version.startswith("v") else version
-    return f"https://github.com/frandorr/aer-extract-aws-goes/releases/download/aer-extract-aws-goes-{v_tag}/"
+def get_default_bucket_uri() -> str:
+    """Return the default Hugging Face bucket URI for LUTs."""
+    return "hf://bucket/frandorr/aer-data"
 
 
 # Known GOES ABI source shapes by flat pixel count.
@@ -290,94 +274,35 @@ def get_default_lut_dir() -> Path:
     return base / "aer" / "extract-aws-goes" / "luts"
 
 
-def download_lut(
-    lut_dir: Path,
-    utm_epsg: int,
-    resolution: int,
-    combo: str,
-    base_url: str | None = None,
-) -> Path:
-    """Download and extract a LUT from the remote repository release assets.
-
-    Args:
-        lut_dir: Local directory where LUTs are stored.
-        utm_epsg: UTM EPSG code (e.g., 32619).
-        resolution: Spatial resolution in meters.
-        combo: Satellite/product combo name (e.g., 'goes19_radf').
-        base_url: Optional base URL for release assets. Defaults to get_default_lut_release_url().
-
-    Returns:
-        Path to the extracted .zarr store.
-    """
-    if base_url is None:
-        base_url = get_default_lut_release_url()
-
-    filename = f"{combo}_{utm_epsg}_{resolution}m.zarr.zip"
-    url = f"{base_url.rstrip('/')}/{filename}"
-    local_zip = lut_dir / filename
-    target_dir = lut_dir / combo / str(utm_epsg) / f"{resolution}m.zarr"
-
-    if target_dir.exists():
-        return target_dir
-
-    print(f"LUT not found locally ({target_dir}). Downloading from {url}...")
-    (lut_dir / combo / str(utm_epsg)).mkdir(parents=True, exist_ok=True)
-
-    try:
-        # Use urllib for zero-dependency download
-        urllib.request.urlretrieve(url, local_zip)
-        with zipfile.ZipFile(local_zip, "r") as zip_ref:
-            # We assume the zip contains the '...m.zarr' directory content
-            # or the '...m.zarr' directory itself.
-            # Best practice is for the zip to contain the directory itself.
-            zip_ref.extractall(lut_dir / combo / str(utm_epsg))
-
-        if local_zip.exists():
-            local_zip.unlink()
-        return target_dir
-    except Exception as e:
-        if local_zip.exists():
-            local_zip.unlink()
-        if target_dir.exists():
-            shutil.rmtree(target_dir, ignore_errors=True)
-        raise RuntimeError(f"Failed to download LUT from {url}: {e}") from e
-
-
 def load_utm_zone_lut(
-    lut_dir: Path,
+    bucket_uri: str | Path,
     utm_epsg: int,
     resolution: int,
     combo: str | None = None,
-    auto_download: bool = True,
 ) -> tuple[UTMZoneLUT, Any]:
-    """Load a UTM zone LUT from a Zarr store, optionally downloading it if missing.
+    """Load a UTM zone LUT from a remote Zarr store (e.g. Hugging Face bucket) or local path.
 
     Args:
-        lut_dir: Root directory for LUTs. If combo is provided, the store is expected
-            at lut_dir / combo / epsg / res m.zarr.
+        bucket_uri: Base URI (e.g., 'hf://frandorr/aer-data') or local path.
         utm_epsg: UTM EPSG code.
         resolution: Spatial resolution in meters.
-        combo: Optional combo name (e.g. 'goes19_radf'). Required if auto_download is True.
-        auto_download: If True and the LUT is missing, attempt to download it.
+        combo: Optional combo name (e.g. 'goes19_radf').
 
     Returns:
         Tuple of (UTMZoneLUT metadata, Zarr group object).
     """
+    bucket_uri_str = str(bucket_uri)
     if combo:
-        store_path = Path(lut_dir) / combo / str(utm_epsg) / f"{resolution}m.zarr"
+        zarr_path = f"{bucket_uri_str.rstrip('/')}/{combo}/{combo}_{utm_epsg}_{resolution}m.zarr"
     else:
-        # Backward compatibility / simple layout
-        store_path = Path(lut_dir) / str(utm_epsg) / f"{resolution}m.zarr"
+        # Backward compatibility / simple layout for tests
+        zarr_path = f"{bucket_uri_str.rstrip('/')}/{utm_epsg}/{resolution}m.zarr"
 
-    if not store_path.exists():
-        if auto_download:
-            if not combo:
-                raise ValueError("auto_download=True requires 'combo' name")
-            download_lut(lut_dir, utm_epsg, resolution, combo)
-        else:
-            raise FileNotFoundError(f"LUT not found at {store_path}")
+    protocol = bucket_uri_str.split("://")[0] if "://" in bucket_uri_str else "file"
+    fs = fsspec.filesystem(protocol)
+    mapper = fs.get_mapper(zarr_path)
 
-    z = zarr.open(str(store_path), mode="r")
+    z = zarr.open(mapper, mode="r")
 
     # Read source_shape if stored, otherwise infer from valid_input_index length
     raw_source_shape = z.attrs.get("source_shape")
@@ -394,7 +319,7 @@ def load_utm_zone_lut(
         area_extent=tuple(z.attrs["area_extent"]),  # pyright: ignore[reportAttributeAccessIssue, reportArgumentType]
         width=z.attrs["width"],  # pyright: ignore[reportAttributeAccessIssue, reportArgumentType]
         height=z.attrs["height"],  # pyright: ignore[reportAttributeAccessIssue, reportArgumentType]
-        zarr_path=str(store_path),
+        zarr_path=zarr_path,
         source_shape=source_shape,
     )
 
