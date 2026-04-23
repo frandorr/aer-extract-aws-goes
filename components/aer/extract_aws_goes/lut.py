@@ -18,7 +18,7 @@ DEFAULT_RADIUS_OF_INFLUENCE = 50_000  # meters, for pyresample kd-tree search
 
 def get_default_bucket_uri() -> str:
     """Return the default Hugging Face bucket URI for LUTs."""
-    return "hf://bucket/frandorr/aer-data"
+    return "hf://buckets/frandorr/aer-data"
 
 
 # Known GOES ABI source shapes by flat pixel count.
@@ -293,7 +293,7 @@ def load_utm_zone_lut(
     """
     bucket_uri_str = str(bucket_uri)
     if combo:
-        zarr_path = f"{bucket_uri_str.rstrip('/')}/{combo}/{combo}_{utm_epsg}_{resolution}m.zarr"
+        zarr_path = f"{bucket_uri_str.rstrip('/')}/{combo}/{utm_epsg}/{resolution}m.zarr"
     else:
         # Backward compatibility / simple layout for tests
         zarr_path = f"{bucket_uri_str.rstrip('/')}/{utm_epsg}/{resolution}m.zarr"
