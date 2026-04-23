@@ -344,9 +344,7 @@ class AwsGoesExtractor(Extractor, plugin_abstract=False):
                 combo = self._detect_combo(href)
 
                 # Load UTM zone LUT (lazy Zarr group, mapping from bucket)
-                lut_info, lut_group = load_utm_zone_lut(
-                    bucket_uri, utm_epsg, int(resolution), combo=combo
-                )
+                lut_info, lut_group = load_utm_zone_lut(bucket_uri, utm_epsg, int(resolution), combo=combo)
                 lut_extent = lut_info.area_extent
                 lut_width = lut_info.width
 
@@ -404,12 +402,13 @@ class AwsGoesExtractor(Extractor, plugin_abstract=False):
                         # Save as GeoTIFF — use the LUT-grid-aligned extent so
                         # pixel values and geospatial coordinates are consistent.
                         area_name = gc_.area_name(int(resolution))
-                        
+
                         combo_parts = AwsGoesExtractor._detect_combo(href).split("_")
                         eoids_sat = f"{combo_parts[0]}_{combo_parts[1]}" if len(combo_parts) >= 2 else "unknown"
                         eoids_prod = collection.split("-")[-1]
-                        
+
                         from aer.eoids import build_eoids_path
+
                         output_path = build_eoids_path(
                             local_dir=local_dir,
                             cell_id=gc_.id(),
@@ -451,7 +450,6 @@ class AwsGoesExtractor(Extractor, plugin_abstract=False):
                             }
                             with rasterio.open(str(output_path), "w", **profile) as dst:
                                 dst.write(cell_data.astype(np.float32), 1)
-                            logger.info("cell_extracted", path=str(output_path), engine="lut")
 
                         artifact_id = hashlib.md5(f"{granule_id}_{area_name}".encode()).hexdigest()
                         return {
@@ -623,12 +621,13 @@ class AwsGoesExtractor(Extractor, plugin_abstract=False):
                 def _extract_cell(gc_: GridCell) -> dict[str, Any] | None:
                     try:
                         area_name = gc_.area_name(int(resolution))
-                        
+
                         combo_parts = AwsGoesExtractor._detect_combo(href).split("_")
                         eoids_sat = f"{combo_parts[0]}_{combo_parts[1]}" if len(combo_parts) >= 2 else "unknown"
                         eoids_prod = collection.split("-")[-1]
-                        
+
                         from aer.eoids import build_eoids_path
+
                         output_path = build_eoids_path(
                             local_dir=local_dir,
                             cell_id=gc_.id(),
@@ -687,7 +686,6 @@ class AwsGoesExtractor(Extractor, plugin_abstract=False):
                             }
                             with rasterio.open(str(output_path), "w", **profile) as dst:
                                 dst.write(cell_data.astype(np.float32), 1)
-                            logger.info("cell_extracted", path=str(output_path))
 
                         # Build artifact row
                         artifact_id = hashlib.md5(f"{granule_id}_{area_name}".encode()).hexdigest()

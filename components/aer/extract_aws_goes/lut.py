@@ -8,6 +8,7 @@ import attrs
 import numpy as np
 import pyproj
 import fsspec
+import os
 import zarr
 from pyresample.geometry import AreaDefinition
 from pyresample.kd_tree import get_neighbour_info
@@ -304,10 +305,9 @@ def load_utm_zone_lut(
             zarr_path = zarr_path[7:]
         z = zarr.open(zarr_path, mode="r")
     else:
-        mapper = fsspec.get_mapper(
-            f"simplecache::{zarr_path}",
-            cache_storage="/tmp/zarr_cache"
-        )
+        cache_dir = os.path.expanduser("~/.cache/aer_cache")
+        os.makedirs(cache_dir, exist_ok=True)
+        mapper = fsspec.get_mapper(f"simplecache::{zarr_path}", cache_storage=cache_dir)
         z = zarr.open(mapper, mode="r")
 
     # Read source_shape if stored, otherwise infer from valid_input_index length
