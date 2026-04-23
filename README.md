@@ -10,7 +10,7 @@ This plugin implements the `AwsGoesExtractor` class which inherits from the `aer
 - **Automated Download**: Fetches NetCDF granules anonymously from AWS S3.
 - **satpy Integration**: Automatically detects and builds `satpy` Scenes (supports ABI-L1b and ABI-L2 collections).
 - **Grid Resampling**: Resamples data to predefined overlapping grid cells using LUT-cached nearest-neighbor interpolation with pixel-perfect numerical parity.
-- **GeoTIFF / NetCDF Saving**: Outputs standard artifacts that preserve geospatial metadata.
+- **GeoTIFF / NetCDF Saving**: Outputs standard artifacts following the **EOIDS** (Earth Observation Imaging Data Structure) directory standard (`loc > date > sat`) and filename convention to preserve precise start/end temporal metadata and prevent filesystem performance degradation.
 - **Concurrent Batching**: Extracts grid cells in parallel across multiple worker threads and processes.
 
 ### Supported Collections
