@@ -278,7 +278,11 @@ class AwsGoesExtractor(Extractor, plugin_abstract=False):
         """
         from aer.extract_aws_goes.lut import get_default_bucket_uri
 
-        bucket_uri = extract_params.get("bucket_uri", get_default_bucket_uri())
+        lut_dir_str = extract_params.get("lut_dir")
+        if lut_dir_str:
+            bucket_uri = str(Path(lut_dir_str))
+        else:
+            bucket_uri = extract_params.get("bucket_uri", get_default_bucket_uri())
 
         assets = extraction_task.assets
         resolution = extraction_task.resolution

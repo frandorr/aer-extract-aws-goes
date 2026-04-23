@@ -299,10 +299,16 @@ def load_utm_zone_lut(
         zarr_path = f"{bucket_uri_str.rstrip('/')}/{utm_epsg}/{resolution}m.zarr"
 
     protocol = bucket_uri_str.split("://")[0] if "://" in bucket_uri_str else "file"
-    fs = fsspec.filesystem(protocol)
-    mapper = fs.get_mapper(zarr_path)
-
-    z = zarr.open(mapper, mode="r")
+    if protocol == "file":
+        if zarr_path.startswith("file://"):
+            zarr_path = zarr_path[7:]
+        z = zarr.open(zarr_path, mode="r")
+    else:
+        mapper = fsspec.get_mapper(
+            f"simplecache::{zarr_path}",
+            cache_storage="/tmp/zarr_cache"
+        )
+        z = zarr.open(mapper, mode="r")
 
     # Read source_shape if stored, otherwise infer from valid_input_index length
     raw_source_shape = z.attrs.get("source_shape")
