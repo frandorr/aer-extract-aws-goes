@@ -1,6 +1,8 @@
 import unittest
+import pytest
 from unittest.mock import MagicMock, patch, PropertyMock
-from datetime import datetime
+import tempfile
+import numpy as np
 import pandas as pd
 import geopandas as gpd
 from shapely.geometry import box
@@ -9,6 +11,7 @@ from aer.interfaces import ExtractionTask
 
 
 class TestUtmGrouping(unittest.TestCase):
+    @pytest.mark.slow
     @patch("s3fs.S3FileSystem")
     @patch("aer.extract_aws_goes.core.Scene")
     def test_extract_groups_by_utm(self, mock_scene_cls, mock_s3):
@@ -16,13 +19,12 @@ class TestUtmGrouping(unittest.TestCase):
         mock_scene = mock_scene_cls.return_value
         mock_scene.available_dataset_names.return_value = ["C01"]
 
-        # Mock resampled dataset
+        # Mock resampled dataset with real numpy data
         mock_da = MagicMock()
+        mock_da.values = np.ones((10, 10), dtype=np.float32)
         mock_da.rio.write_crs.return_value = mock_da
-        mock_da.rio.clip_box.return_value = mock_da
-        mock_da.rio.reproject.return_value = mock_da
 
-        mock_resampled_scene = {"C01": mock_da}  # Simulate dict-like access
+        mock_resampled_scene = {"C01": mock_da}
         mock_scene.resample.return_value = mock_resampled_scene
 
         # Create assets
@@ -60,37 +62,40 @@ class TestUtmGrouping(unittest.TestCase):
         gc2 = make_mock_gc("EPSG:32610", box(100, 100, 200, 200), box(-79, 20, -78, 21), "cell2", "cell2_area")
         gc3 = make_mock_gc("EPSG:32611", box(0, 0, 100, 100), box(-70, 20, -69, 21), "cell3", "cell3_area")
 
-        task = ExtractionTask(
-            assets=assets, target_grid_d=100000, target_grid_overlap=False, resolution=2000.0, uri="/tmp/test_output"
-        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Create a dummy file so that the post-extraction cleanup (unlink) succeeds
+            import os
+            dummy_nc = os.path.join(tmpdir, "OR_ABI-L1b-RadC-M6C01_G16_s2025001120000.nc")
+            open(dummy_nc, "w").close()
 
-        # Mock Path in core to avoid real FS operations
-        with patch("aer.extract_aws_goes.core.Path") as mock_path_cls:
+            task = ExtractionTask(
+                assets=assets, target_grid_d=100000, target_grid_overlap=False, resolution=2000.0, uri=tmpdir
+            )
 
-            def path_side_effect(path_str):
-                m = MagicMock()
-                m.__str__.return_value = str(path_str)
-                m.__truediv__.side_effect = lambda x: path_side_effect(f"{path_str}/{x}")
-                m.exists.return_value = not str(path_str).endswith(".tif")
-                return m
+            # Track rasterio.open calls by wrapping the real function
+            import rasterio as _real_rasterio
 
-            mock_path_cls.side_effect = path_side_effect
+            rio_open_calls = []
+            original_open = _real_rasterio.open
 
-            with patch.object(mock_da.rio, "to_raster") as mock_to_raster:
+            def tracking_open(*args, **kwargs):
+                rio_open_calls.append(args)
+                return original_open(*args, **kwargs)
+
+            with patch.object(_real_rasterio, "open", side_effect=tracking_open):
                 with patch(
                     "aer.interfaces.core.ExtractionTask.overlapping_grid_cells", new_callable=PropertyMock
                 ) as mock_overlap:
                     mock_overlap.return_value = [gc1, gc2, gc3]
                     extractor = AwsGoesExtractor()
-                    # Fix ArtifactSchema validation if it fails due to mocked geometry
                     with patch("aer.extract_aws_goes.core.ArtifactSchema.validate", side_effect=lambda x: x):
-                        result = extractor.extract(task)
+                        result = extractor.extract(task, extract_params={"engine": "satpy"})
 
             # Verify resample calls: should be 2 (one for EPSG:32610, one for EPSG:32611)
             self.assertEqual(mock_scene.resample.call_count, 2)
 
-            # Verify to_raster calls: should be 3
-            self.assertEqual(mock_to_raster.call_count, 3)
+            # Verify rasterio.open calls: should be 3 (one per grid cell)
+            self.assertEqual(len(rio_open_calls), 3)
 
             # Verify artifact rows
             self.assertEqual(len(result), 3)

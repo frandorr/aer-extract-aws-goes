@@ -1,7 +1,8 @@
+import re
 import math
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import attrs
 import numpy as np
@@ -33,7 +34,7 @@ def get_default_lut_release_url() -> str:
     version = get_package_version()
     # Normalize version: ensure it starts with 'v' if needed, though releases usually use v1.1.0
     v_tag = f"v{version}" if not version.startswith("v") else version
-    return f"https://github.com/frandorr/aer-extract-aws-goes/releases/download/{v_tag}-luts/"
+    return f"https://github.com/frandorr/aer-extract-aws-goes/releases/download/aer-extract-aws-goes-{v_tag}/"
 
 
 # Known GOES ABI source shapes by flat pixel count.
@@ -63,6 +64,60 @@ def infer_source_shape(n_pixels: int) -> tuple[int, int]:
     raise ValueError(
         f"Cannot infer source shape from {n_pixels} pixels. Known shapes: {list(KNOWN_GOES_SHAPES.values())}"
     )
+
+
+def _parse_goes_filename(filename: str) -> dict[str, Any]:
+    """Parse start/end times and band channel ID from a GOES-R filename.
+
+    Example: OR_ABI-L1b-RadF-M6C01_G16_s202312312345678_e202312312354567_c202312312355432.nc
+
+    The channel ID is extracted from the ``C##`` portion (e.g. ``"1"`` from
+    ``C01``, ``"13"`` from ``C13``).
+    """
+    match = re.search(r"_s(\d{13})\d*_e(\d{13})\d*_c(\d{13})\d*\.nc", filename)
+    if not match:
+        return {}
+
+    start_str = match.group(1)
+    end_str = match.group(2)
+
+    try:
+        start_time = datetime.strptime(start_str, "%Y%j%H%M%S").replace(tzinfo=timezone.utc)
+        end_time = datetime.strptime(end_str, "%Y%j%H%M%S").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return {}
+
+    # Extract band/channel ID from the filename (e.g. C01 → "1", C13 → "13")
+    band_match = re.search(r"-M\d+C(\d+)", filename)
+    channel_id = str(int(band_match.group(1))) if band_match else None
+
+    # Extract satellite ID (e.g. G16)
+    sat_match = re.search(r"_G(\d+)_", filename)
+    sat_id = int(sat_match.group(1)) if sat_match else None
+
+    # Extract product/collection
+    product_match = re.search(r"OR_(.*?)-M\d+C\d+", filename)
+    product = product_match.group(1) if product_match else None
+
+    return {
+        "start_time": start_time,
+        "end_time": end_time,
+        "channel_id": channel_id,
+        "sat_id": sat_id,
+        "product": product,
+    }
+
+
+def _parse_domain(collection: str) -> str:
+    """Parse the domain from a GOES product collection name."""
+    if not collection:
+        raise ValueError("Collection name is empty")
+    domain = collection[-1]
+    if domain in ["C", "F", "M"]:
+        return domain
+    if "GLM-L2-LCFA" in collection:
+        return "F"
+    raise ValueError(f"Unknown GOES domain in collection name: {collection}")
 
 
 @attrs.frozen
@@ -108,32 +163,57 @@ def compute_utm_zone_area_extent(utm_epsg: int, resolution: int) -> tuple[float,
     return minx, miny, maxx, maxy, width, height
 
 
-def compute_goes_source_area_def(goes_file: str | Path) -> AreaDefinition:
-    import h5py
-    import numpy as np
+def compute_goes_source_area_def(
+    goes_file: str | Path | None = None,
+    sat: str | None = None,
+    domain: str | None = None,
+    res: str | None = None,
+) -> AreaDefinition:
+    """Compute the GOES source area definition.
+
+    Can be computed either from a GOES filename or by explicitly providing
+    the satellite, domain, and resolution.
+
+    Args:
+        goes_file: Path to the GOES NetCDF file. If provided, metadata is parsed from filename.
+        sat: Optional satellite name ("east" or "west").
+        domain: Optional domain ("f", "c", or "p").
+        res: Optional resolution ("500m", "1km", or "2km").
+
+    Returns:
+        pyresample.geometry.AreaDefinition: The source area definition.
+    """
     from pyresample import load_area
     from pathlib import Path
 
-    with h5py.File(goes_file, "r") as f:
-        var = f["goes_imager_projection"]
-        lon = var.attrs["longitude_of_projection_origin"][0]
-        sat = "east" if lon > -100 else "west"
+    if not (sat and domain and res):
+        if not goes_file:
+            raise ValueError("Must provide either goes_file or all of (sat, domain, res)")
 
-        rad = f.get("Rad") or f.get("CMI")
-        height, width = rad.shape
-        scene_id = f.attrs["scene_id"]
-        if isinstance(scene_id, (list, tuple, np.ndarray)):
-            scene_id = scene_id[0]
-        if hasattr(scene_id, "decode"):
-            scene_id = scene_id.decode("utf-8")
+        filename = Path(goes_file).name
+        info = _parse_goes_filename(filename)
+        if not (info.get("sat_id") and info.get("product") and info.get("channel_id")):
+            raise ValueError(f"Could not parse GOES metadata from filename: {filename}")
 
-        domain = "f" if "Full" in scene_id else ("c" if "CONUS" in scene_id else "p")
-        res = "500m" if width >= 20000 else ("1km" if width >= 10000 else "2km")
+        if not sat:
+            sat = "east" if info["sat_id"] in (16, 19) else "west"
+        if not domain:
+            domain_code = _parse_domain(info["product"])
+            domain = "f" if domain_code == "F" else ("c" if domain_code == "C" else "p")
+        if not res:
+            channel_id = int(info["channel_id"])
+            if channel_id == 2:
+                res = "500m"
+            elif channel_id in (1, 3, 5):
+                res = "1km"
+            else:
+                res = "2km"
 
-        area_name = f"goes_{sat}_abi_{domain}_{res}"
-
+    if sat == "west" and domain == "c":
+        domain = "p"
+    area_name = f"goes_{sat}_abi_{domain}_{res}"
     areas_path = Path(__file__).parent / "areas.yaml"
-    return load_area(str(areas_path), area_name)
+    return cast(AreaDefinition, load_area(str(areas_path), area_name))
 
 
 def generate_utm_zone_lut(
@@ -181,25 +261,19 @@ def generate_utm_zone_lut(
     z.attrs["source_shape"] = [source_area_def.height, source_area_def.width]
 
     # Store arrays with chunking
-    z.create_array(
+    z.create_array(  # pyright: ignore[reportAttributeAccessIssue]
         "valid_input_index",
         data=valid_input_index,
-        shape=valid_input_index.shape,
-        dtype=bool,
         chunks=(chunk_size * chunk_size,),
     )
-    z.create_array(
+    z.create_array(  # pyright: ignore[reportAttributeAccessIssue]
         "valid_output_index",
         data=valid_output_index,
-        shape=valid_output_index.shape,
-        dtype=bool,
         chunks=(chunk_size * chunk_size,),
     )
-    z.create_array(
+    z.create_array(  # pyright: ignore[reportAttributeAccessIssue]
         "index_array",
         data=index_array.astype(np.int32),
-        shape=index_array.shape,
-        dtype=np.int32,
         chunks=(chunk_size * chunk_size,),
     )
 
@@ -308,18 +382,18 @@ def load_utm_zone_lut(
     # Read source_shape if stored, otherwise infer from valid_input_index length
     raw_source_shape = z.attrs.get("source_shape")
     if raw_source_shape is not None:
-        source_shape: tuple[int, int] | None = (int(raw_source_shape[0]), int(raw_source_shape[1]))
+        source_shape: tuple[int, int] | None = (int(raw_source_shape[0]), int(raw_source_shape[1]))  # pyright: ignore[reportIndexIssue, reportArgumentType]
     else:
         # Infer from valid_input_index array length
-        vi_len = z["valid_input_index"].shape[0]
+        vi_len = z["valid_input_index"].shape[0]  # pyright: ignore[reportAttributeAccessIssue, reportGeneralTypeIssues, reportArgumentType]
         source_shape = infer_source_shape(vi_len)
 
     lut_meta = UTMZoneLUT(
-        utm_epsg=z.attrs["utm_epsg"],
-        resolution=z.attrs["resolution"],
-        area_extent=tuple(z.attrs["area_extent"]),
-        width=z.attrs["width"],
-        height=z.attrs["height"],
+        utm_epsg=z.attrs["utm_epsg"],  # pyright: ignore[reportAttributeAccessIssue, reportArgumentType]
+        resolution=z.attrs["resolution"],  # pyright: ignore[reportAttributeAccessIssue, reportArgumentType]
+        area_extent=tuple(z.attrs["area_extent"]),  # pyright: ignore[reportAttributeAccessIssue, reportArgumentType]
+        width=z.attrs["width"],  # pyright: ignore[reportAttributeAccessIssue, reportArgumentType]
+        height=z.attrs["height"],  # pyright: ignore[reportAttributeAccessIssue, reportArgumentType]
         zarr_path=str(store_path),
         source_shape=source_shape,
     )
@@ -439,7 +513,7 @@ def compute_cell_slice(
             - row_slice, col_slice: Slices into the 2D LUT grid.
             - effective_extent (tuple): (minx, miny, maxx, maxy) of the slice on the LUT grid.
     """
-    lut_minx, lut_miny, lut_maxx, lut_maxy = lut_area_extent
+    lut_minx, lut_miny, _, lut_maxy = lut_area_extent
     cell_minx, cell_miny, cell_maxx, cell_maxy = cell_utm_footprint_bounds
     lut_height = int(round((lut_maxy - lut_miny) / resolution))
 
@@ -530,10 +604,10 @@ def read_goes_crop(
         var = f[variable]
         crop = var[row_slice, col_slice]  # type: ignore[index]
         if apply_scale_offset and "scale_factor" in var.attrs:
-            crop = crop.astype(np.float32) * var.attrs["scale_factor"][0] + var.attrs["add_offset"][0]
+            crop = crop.astype(np.float32) * var.attrs["scale_factor"][0] + var.attrs["add_offset"][0]  # pyright: ignore[reportAttributeAccessIssue, reportIndexIssue]
         else:
-            crop = crop.astype(np.float32)
-    return crop
+            crop = crop.astype(np.float32)  # pyright: ignore[reportAttributeAccessIssue]
+    return cast(np.ndarray, crop)
 
 
 def extract_cell_from_lut(
@@ -543,7 +617,6 @@ def extract_cell_from_lut(
     lut_group: zarr.Group,
     cell_row_slice: slice,
     cell_col_slice: slice,
-    lut_height: int,
     lut_width: int,
 ) -> np.ndarray:
     """Extract a grid cell's data using pre-computed LUT arrays.
@@ -553,7 +626,7 @@ def extract_cell_from_lut(
         row_offsets, col_offsets: Coordinate arrays from compute_source_crop_slices.
         lut_group: Zarr group with valid_output_index and index_array.
         cell_row_slice, cell_col_slice: Slices within the full UTM zone LUT grid.
-        lut_height, lut_width: Full dimensions of the UTM zone grid.
+        lut_width: Full dimensions of the UTM zone grid.
 
     Returns:
         2D float32 array of shape (cell_height, cell_width).
