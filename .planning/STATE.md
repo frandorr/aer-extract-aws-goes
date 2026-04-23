@@ -61,6 +61,7 @@ None.
 | 260326-wzv | Adapt bench_performance.py LUT save/loa... | 2026-03-26 | skipped | [260326-wzv-adapt-bench-performance-py-lut-save-load](./quick/260326-wzv-adapt-bench-performance-py-lut-save-load/) |
 | 260327 | Apply LUT resampling from extraction_v4... | 2026-03-27 | d3e9fca, 70991d4 | [260327-apply-lut-resampling-from-extraction-v4](./quick/260327-apply-lut-resampling-from-extraction-v4-/) |
 | 260327-mov | Parallelize search_results loop in extract_aws_goes | 2026-03-27 | 1f502af | [260327-mov-parallelize-search-results-loop-in-extra](./quick/260327-mov-parallelize-search-results-loop-in-extra/) |
+| 260423-41a | refactor LUT storage to use fsspec and huggingface buckets | 2026-04-23 | 4683fe4 | [260423-41a-refactor-lut-storage-to-use-fsspec-and-h](./quick/260423-41a-refactor-lut-storage-to-use-fsspec-and-h/) |
 
 ## Accumulated Context
 
@@ -72,4 +73,4 @@ None.
 
 ## Continuity
 
-Last activity: 2026-04-21
+Last activity: 2026-04-23 - Completed quick task 260423-41a: refactor LUT storage to use fsspec and huggingface buckets
