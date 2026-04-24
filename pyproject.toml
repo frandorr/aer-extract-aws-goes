@@ -21,12 +21,15 @@ dependencies = [
     "rioxarray>=0.22.0",
     "satpy>=0.60.0",
     "xarray>=2026.2.0",
-    "zarr>=2.18.0",
+    "blosc2>=4.1.2",
 ]
 
 
 [project.entry-points."aer.plugins"]
 extract_aws_goes = "aer.extract_aws_goes.core:AwsGoesExtractor"
+
+[project.scripts]
+generate-luts = "aer.extract_aws_goes.generate_luts:main"
 
 
 [tool.uv]
@@ -70,6 +73,7 @@ dev = [
     "line-profiler>=5.0.2",
     "marimo>=0.21.1",
     "matplotlib>=3.10.8",
+    "odc-geo>=0.5.1",
     "polylith-cli>=1.43.0,<2.0.0",
     "pytest>=9.0.2,<10.0.0",
     "python-semantic-release>=10.5.3,<11.0.0",

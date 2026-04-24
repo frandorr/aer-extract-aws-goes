@@ -1,17 +1,26 @@
-import re
-import math
-from datetime import datetime, timezone
+import xarray as xr
+from rasterio.transform import from_bounds
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
+import cattrs
 
 import attrs
 import numpy as np
-import pyproj
 import fsspec
 import os
-import zarr
 from pyresample.geometry import AreaDefinition
 from pyresample.kd_tree import get_neighbour_info
+from structlog import get_logger
+from .utils import (
+    compute_utm_zone_area_extent,
+    compute_source_crop_slices,
+    compute_goes_source_area_def,
+    parse_goes_filename,
+    compute_cell_slice,
+)
+from aer.grid import GridCell
+
+logger = get_logger()
 
 SUPPORTED_RESOLUTIONS = (500, 1000, 2000)
 DEFAULT_RADIUS_OF_INFLUENCE = 50_000  # meters, for pyresample kd-tree search
@@ -19,90 +28,23 @@ DEFAULT_RADIUS_OF_INFLUENCE = 50_000  # meters, for pyresample kd-tree search
 
 def get_default_bucket_uri() -> str:
     """Return the default Hugging Face bucket URI for LUTs."""
-    return "hf://buckets/frandorr/aer-data"
+    return "hf://datasets/frandorr/aer-data/luts"
 
 
-# Known GOES ABI source shapes by flat pixel count.
-# Used to reshape valid_input_index when source_shape is not stored in metadata.
-KNOWN_GOES_SHAPES: dict[int, tuple[int, int]] = {
-    # Full Disk
-    21696 * 21696: (21696, 21696),  # 0.5 km (C01, C03)
-    10848 * 10848: (10848, 10848),  # 1 km   (C02)
-    5424 * 5424: (5424, 5424),  # 2 km   (all others)
-    # CONUS
-    3000 * 5000: (3000, 5000),  # 0.5 km
-    1500 * 2500: (1500, 2500),  # 1 km
-    750 * 1250: (750, 1250),  # 2 km
-}
-
-
-def infer_source_shape(n_pixels: int) -> tuple[int, int]:
-    """Infer the 2D GOES source shape from the flat pixel count.
-
-    Falls back to assuming a square grid if the shape is not in KNOWN_GOES_SHAPES.
-    """
-    if n_pixels in KNOWN_GOES_SHAPES:
-        return KNOWN_GOES_SHAPES[n_pixels]
-    side = int(math.isqrt(n_pixels))
-    if side * side == n_pixels:
-        return (side, side)
-    raise ValueError(
-        f"Cannot infer source shape from {n_pixels} pixels. Known shapes: {list(KNOWN_GOES_SHAPES.values())}"
-    )
-
-
-def _parse_goes_filename(filename: str) -> dict[str, Any]:
-    """Parse start/end times and band channel ID from a GOES-R filename.
-
-    Example: OR_ABI-L1b-RadF-M6C01_G16_s202312312345678_e202312312354567_c202312312355432.nc
-
-    The channel ID is extracted from the ``C##`` portion (e.g. ``"1"`` from
-    ``C01``, ``"13"`` from ``C13``).
-    """
-    match = re.search(r"_s(\d{13})\d*_e(\d{13})\d*_c(\d{13})\d*\.nc", filename)
-    if not match:
-        return {}
-
-    start_str = match.group(1)
-    end_str = match.group(2)
+def uri_exists(uri: str | Path) -> bool:
+    """Check if a URI (local or remote) exists."""
+    path_str = str(uri)
+    protocol = path_str.split("://")[0] if "://" in path_str else "file"
+    if protocol == "file":
+        # Handle file:// prefix if present
+        local_path = path_str[7:] if path_str.startswith("file://") else path_str
+        return Path(local_path).exists()
 
     try:
-        start_time = datetime.strptime(start_str, "%Y%j%H%M%S").replace(tzinfo=timezone.utc)
-        end_time = datetime.strptime(end_str, "%Y%j%H%M%S").replace(tzinfo=timezone.utc)
-    except ValueError:
-        return {}
-
-    # Extract band/channel ID from the filename (e.g. C01 → "1", C13 → "13")
-    band_match = re.search(r"-M\d+C(\d+)", filename)
-    channel_id = str(int(band_match.group(1))) if band_match else None
-
-    # Extract satellite ID (e.g. G16)
-    sat_match = re.search(r"_G(\d+)_", filename)
-    sat_id = int(sat_match.group(1)) if sat_match else None
-
-    # Extract product/collection
-    product_match = re.search(r"OR_(.*?)-M\d+C\d+", filename)
-    product = product_match.group(1) if product_match else None
-
-    return {
-        "start_time": start_time,
-        "end_time": end_time,
-        "channel_id": channel_id,
-        "sat_id": sat_id,
-        "product": product,
-    }
-
-
-def _parse_domain(collection: str) -> str:
-    """Parse the domain from a GOES product collection name."""
-    if not collection:
-        raise ValueError("Collection name is empty")
-    domain = collection[-1]
-    if domain in ["C", "F", "M"]:
-        return domain
-    if "GLM-L2-LCFA" in collection:
-        return "F"
-    raise ValueError(f"Unknown GOES domain in collection name: {collection}")
+        fs, path = fsspec.core.url_to_fs(uri)
+        return fs.exists(path)
+    except Exception:
+        return False
 
 
 @attrs.frozen
@@ -112,98 +54,42 @@ class UTMZoneLUT:
     area_extent: tuple[float, float, float, float]
     width: int
     height: int
-    zarr_path: str
-    source_shape: tuple[int, int] | None = None
+    row_map: Any
+    col_map: Any
+    crop_slices: tuple[int, int, int, int]
+    source_shape: tuple[int, int]
+    lut_path: str
+    satellite: str
+    domain: str
 
 
-def compute_utm_zone_area_extent(utm_epsg: int, resolution: int) -> tuple[float, float, float, float, int, int]:
-    crs = pyproj.CRS.from_epsg(utm_epsg)
-    area = crs.area_of_use
-    if area is None:
-        raise ValueError(f"Could not determine area of use for EPSG:{utm_epsg}")
+def generate_utm_zone_lut(goes_path: Path, utm_epsg: int, resolution: int, output_uri: Path | str | None) -> UTMZoneLUT:
+    """
+    Generate a lookup table (LUT) to map GOES source data to a UTM zone grid.
 
-    west, south, east, north = area.bounds
-    transformer = pyproj.Transformer.from_crs("EPSG:4326", crs, always_xy=True)
+    The LUT is stored as a NumPy .npz file with two 2D int16 arrays:
+    - row_map: (height, width) int16 — row index into the GOES crop for each UTM pixel, or -1 if invalid
+    - col_map: (height, width) int16 — col index into the GOES crop for each UTM pixel, or -1 if invalid
 
-    lons = np.concatenate(
-        [np.linspace(west, east, 100), np.full(100, east), np.linspace(east, west, 100), np.full(100, west)]
-    )
-    lats = np.concatenate(
-        [np.full(100, south), np.linspace(south, north, 100), np.full(100, north), np.linspace(north, south, 100)]
-    )
-
-    xs, ys = transformer.transform(lons, lats)
-
-    minx, miny = float(np.min(xs)), float(np.min(ys))
-    maxx, maxy = float(np.max(xs)), float(np.max(ys))
-
-    minx = math.floor(minx / resolution) * resolution
-    miny = math.floor(miny / resolution) * resolution
-    maxx = math.ceil(maxx / resolution) * resolution
-    maxy = math.ceil(maxy / resolution) * resolution
-
-    width = int((maxx - minx) / resolution)
-    height = int((maxy - miny) / resolution)
-
-    return minx, miny, maxx, maxy, width, height
-
-
-def compute_goes_source_area_def(
-    goes_file: str | Path | None = None,
-    sat: str | None = None,
-    domain: str | None = None,
-    res: str | None = None,
-) -> AreaDefinition:
-    """Compute the GOES source area definition.
-
-    Can be computed either from a GOES filename or by explicitly providing
-    the satellite, domain, and resolution.
+    This eliminates the need to pre-load any offset arrays into RAM. Each cell extraction
+    requires only two 2D memmapped reads (row_map[row_sl, col_sl] and col_map[row_sl, col_sl]).
+    crop_slices provide the zero-S3-read initial GOES file crop.
 
     Args:
-        goes_file: Path to the GOES NetCDF file. If provided, metadata is parsed from filename.
-        sat: Optional satellite name ("east" or "west").
-        domain: Optional domain ("f", "c", or "p").
-        res: Optional resolution ("500m", "1km", or "2km").
-
-    Returns:
-        pyresample.geometry.AreaDefinition: The source area definition.
+        goes_path: Path to the GOES NetCDF file.
+        utm_epsg: The UTM EPSG code.
+        resolution: The resolution.
+        output_uri: URI to save the LUT to. If None, the LUT will not be saved.
     """
-    from pyresample import load_area
-    from pathlib import Path
+    # if output_uri is not None check if file already exist and return loading the lut
+    sat_info = parse_goes_filename(str(goes_path))
+    if output_uri is not None:
+        lut_path = generate_path(output_uri, sat_info.get("sat", ""), sat_info.get("domain", ""), utm_epsg, resolution)
+        if uri_exists(lut_path):
+            return load_lut(lut_path)
 
-    if not (sat and domain and res):
-        if not goes_file:
-            raise ValueError("Must provide either goes_file or all of (sat, domain, res)")
+    source_area_def = compute_goes_source_area_def(goes_path)
 
-        filename = Path(goes_file).name
-        info = _parse_goes_filename(filename)
-        if not (info.get("sat_id") and info.get("product") and info.get("channel_id")):
-            raise ValueError(f"Could not parse GOES metadata from filename: {filename}")
-
-        if not sat:
-            sat = "east" if info["sat_id"] in (16, 19) else "west"
-        if not domain:
-            domain_code = _parse_domain(info["product"])
-            domain = "f" if domain_code == "F" else ("c" if domain_code == "C" else "p")
-        if not res:
-            channel_id = int(info["channel_id"])
-            if channel_id == 2:
-                res = "500m"
-            elif channel_id in (1, 3, 5):
-                res = "1km"
-            else:
-                res = "2km"
-
-    if sat == "west" and domain == "c":
-        domain = "p"
-    area_name = f"goes_{sat}_abi_{domain}_{res}"
-    areas_path = Path(__file__).parent / "areas.yaml"
-    return cast(AreaDefinition, load_area(str(areas_path), area_name))
-
-
-def generate_utm_zone_lut(
-    source_area_def: AreaDefinition, utm_epsg: int, resolution: int, output_dir: Path, chunk_size: int = 1024
-) -> None:
     minx, miny, maxx, maxy, width, height = compute_utm_zone_area_extent(utm_epsg, resolution)
 
     target_area_def = AreaDefinition(
@@ -216,372 +102,226 @@ def generate_utm_zone_lut(
         area_extent=(minx, miny, maxx, maxy),
     )
 
-    valid_input_index, valid_output_index, index_array, target_shape = get_neighbour_info(
+    valid_input_index, valid_output_index, index_array, _ = get_neighbour_info(
         source_area_def, target_area_def, radius_of_influence=DEFAULT_RADIUS_OF_INFLUENCE, neighbours=1, nprocs=-1
     )
 
-    store_dir = Path(output_dir) / str(utm_epsg)
-    store_dir.mkdir(parents=True, exist_ok=True)
-    store_path = store_dir / f"{resolution}m.zarr"
+    source_shape = (source_area_def.height, source_area_def.width)
+    row_sl, col_sl, row_offsets, col_offsets = compute_source_crop_slices(valid_input_index, source_shape)
 
-    z = zarr.open(str(store_path), mode="w")
+    n_valid_in = int(valid_input_index.sum())
+    n_target = height * width
 
-    # Store metadata
-    z.attrs["utm_epsg"] = utm_epsg
-    z.attrs["resolution"] = resolution
-    z.attrs["area_extent"] = [minx, miny, maxx, maxy]
-    z.attrs["width"] = width
-    z.attrs["height"] = height
+    row_map = np.full(n_target, -1, dtype=np.int16)
+    col_map = np.full(n_target, -1, dtype=np.int16)
 
-    if hasattr(source_area_def, "crs") and source_area_def.crs is not None:
-        source_crs_wkt = source_area_def.crs.to_wkt()
-    elif hasattr(source_area_def, "proj_dict"):
-        source_crs_wkt = pyproj.CRS(source_area_def.proj_dict).to_wkt()
+    # Flat indices into the target grid that have a valid neighbor
+    valid_out_flat = np.flatnonzero(valid_output_index)
+
+    # Guard against fill values (index == n_valid_in means no valid neighbor)
+    valid_ia_mask = index_array < n_valid_in
+    valid_out_with_neighbor = valid_out_flat[valid_ia_mask]
+    ia_clipped = index_array[valid_ia_mask]
+
+    row_map[valid_out_with_neighbor] = row_offsets[ia_clipped].astype(np.int16)
+    col_map[valid_out_with_neighbor] = col_offsets[ia_clipped].astype(np.int16)
+
+    row_map_2d = row_map.reshape(height, width)
+    col_map_2d = col_map.reshape(height, width)
+
+    zone_lut_dict = dict(
+        utm_epsg=utm_epsg,
+        resolution=resolution,
+        area_extent=(minx, miny, maxx, maxy),
+        width=width,
+        height=height,
+        crop_slices=(row_sl.start, row_sl.stop, col_sl.start, col_sl.stop),
+        source_shape=(source_area_def.height, source_area_def.width),
+        row_map=row_map_2d,
+        col_map=col_map_2d,
+        satellite=sat_info.get("sat", ""),
+        domain=sat_info.get("domain", ""),
+        lut_path=generate_path(output_uri, sat_info.get("sat", ""), sat_info.get("domain", ""), utm_epsg, resolution),
+    )
+
+    utm_zone_lut = cattrs.structure(zone_lut_dict, UTMZoneLUT)
+
+    if output_uri is not None:
+        save_utm_zone_lut(utm_zone_lut)
+
+    return utm_zone_lut
+
+
+def save_lut(path: str | Path, lut: UTMZoneLUT):
+    # np.savez is used for speed (uncompressed). Metadata is saved as arrays.
+    np.savez_compressed(
+        str(path),
+        row_map=lut.row_map,
+        col_map=lut.col_map,
+        utm_epsg=lut.utm_epsg,
+        resolution=lut.resolution,
+        area_extent=lut.area_extent,
+        width=lut.width,
+        height=lut.height,
+        crop_slices=lut.crop_slices,
+        source_shape=lut.source_shape,
+        satellite=lut.satellite,
+        domain=lut.domain,
+    )
+
+
+def generate_path(uri, sat, domain, utm_epsg, resolution) -> str:
+    return f"{str(uri).rstrip('/')}/{sat}_{domain}/{utm_epsg}/{resolution}m.npz"
+
+
+def save_utm_zone_lut(
+    lut: UTMZoneLUT,
+):
+    lut_path = lut.lut_path
+    if not lut_path:
+        raise ValueError("UTMZoneLUT does not have a lut_path set")
+
+    # Only create directories for local paths
+    protocol = lut_path.split("://")[0] if "://" in lut_path else "file"
+    if protocol == "file":
+        local_path = Path(lut_path[7:] if lut_path.startswith("file://") else lut_path)
+        local_path.parent.mkdir(parents=True, exist_ok=True)
+        save_lut(local_path, lut)
     else:
-        source_crs_wkt = ""
-
-    z.attrs["source_crs_wkt"] = source_crs_wkt
-    z.attrs["created"] = datetime.now(tz=timezone.utc).isoformat()
-    z.attrs["shape"] = [height, width]
-    z.attrs["source_shape"] = [source_area_def.height, source_area_def.width]
-
-    # Store arrays with chunking
-    z.create_array(  # pyright: ignore[reportAttributeAccessIssue]
-        "valid_input_index",
-        data=valid_input_index,
-        chunks=(chunk_size * chunk_size,),
-    )
-    z.create_array(  # pyright: ignore[reportAttributeAccessIssue]
-        "valid_output_index",
-        data=valid_output_index,
-        chunks=(chunk_size * chunk_size,),
-    )
-    z.create_array(  # pyright: ignore[reportAttributeAccessIssue]
-        "index_array",
-        data=index_array.astype(np.int32),
-        chunks=(chunk_size * chunk_size,),
-    )
+        save_lut(lut_path, lut)
 
 
-def get_default_lut_dir() -> Path:
-    """Return the platform-specific default cache directory for LUTs."""
-    import os
+def load_lut(path: str | Path) -> UTMZoneLUT:
+    # np.load with mmap_mode='r' is lazy and only loads metadata initially.
+    # It will raise an error if the path doesn't exist.
+    # Note: fsspec paths might not support mmap_mode directly,
+    # but since we are focusing on local data for speed, this is optimized for local.
+    with np.load(str(path), mmap_mode="r") as data:
+        # Extract metadata and arrays
+        # Scalars are returned as 0-d arrays, so we use .item() or [()]
+        lut_dict = {
+            "utm_epsg": int(data["utm_epsg"]),
+            "resolution": int(data["resolution"]),
+            "area_extent": tuple(data["area_extent"]),
+            "width": int(data["width"]),
+            "height": int(data["height"]),
+            "crop_slices": tuple(data["crop_slices"]),
+            "source_shape": tuple(data["source_shape"]),
+            "satellite": str(data["satellite"]),
+            "domain": str(data["domain"]),
+            "row_map": data["row_map"],
+            "col_map": data["col_map"],
+            "lut_path": str(path),
+        }
 
-    if "XDG_CACHE_HOME" in os.environ:
-        base = Path(os.environ["XDG_CACHE_HOME"])
-    else:
-        base = Path.home() / ".cache"
-
-    return base / "aer" / "extract-aws-goes" / "luts"
+    return cattrs.structure(lut_dict, UTMZoneLUT)
 
 
 def load_utm_zone_lut(
-    bucket_uri: str | Path,
+    uri: str | Path,
     utm_epsg: int,
     resolution: int,
     combo: str | None = None,
-) -> tuple[UTMZoneLUT, Any]:
-    """Load a UTM zone LUT from a remote Zarr store (e.g. Hugging Face bucket) or local path.
+) -> UTMZoneLUT:
+    """Load a UTM zone LUT from a NumPy .npz file (local path recommended).
 
     Args:
-        bucket_uri: Base URI (e.g., 'hf://frandorr/aer-data') or local path.
+        uri: Base URI (e.g., '/path/to/luts') or local path.
         utm_epsg: UTM EPSG code.
         resolution: Spatial resolution in meters.
-        combo: Optional combo name (e.g. 'goes19_radf').
+        combo: Optional combo name (e.g. 'goes_east_f').
 
     Returns:
-        Tuple of (UTMZoneLUT metadata, Zarr group object).
+        UTMZoneLUT metadata.
     """
-    bucket_uri_str = str(bucket_uri)
+    bucket_uri_str = str(uri).rstrip("/")
+
     if combo:
-        zarr_path = f"{bucket_uri_str.rstrip('/')}/{combo}/{utm_epsg}/{resolution}m.zarr"
+        lut_path = f"{bucket_uri_str}/{combo}/{utm_epsg}/{resolution}m.npz"
     else:
-        # Backward compatibility / simple layout for tests
-        zarr_path = f"{bucket_uri_str.rstrip('/')}/{utm_epsg}/{resolution}m.zarr"
+        lut_path = f"{bucket_uri_str}/{utm_epsg}/{resolution}m.npz"
 
-    protocol = bucket_uri_str.split("://")[0] if "://" in bucket_uri_str else "file"
-    if protocol == "file":
-        if zarr_path.startswith("file://"):
-            zarr_path = zarr_path[7:]
-        z = zarr.open(zarr_path, mode="r")
-    else:
-        cache_dir = os.path.expanduser("~/.cache/aer_cache")
-        os.makedirs(cache_dir, exist_ok=True)
-        mapper = fsspec.get_mapper(f"filecache::{zarr_path}", cache_storage=cache_dir)
-        z = zarr.open(mapper, mode="r")
-
-    # Read source_shape if stored, otherwise infer from valid_input_index length
-    raw_source_shape = z.attrs.get("source_shape")
-    if raw_source_shape is not None:
-        source_shape: tuple[int, int] | None = (int(raw_source_shape[0]), int(raw_source_shape[1]))  # pyright: ignore[reportIndexIssue, reportArgumentType]
-    else:
-        # Infer from valid_input_index array length
-        vi_len = z["valid_input_index"].shape[0]  # pyright: ignore[reportAttributeAccessIssue, reportGeneralTypeIssues, reportArgumentType]
-        source_shape = infer_source_shape(vi_len)
-
-    lut_meta = UTMZoneLUT(
-        utm_epsg=z.attrs["utm_epsg"],  # pyright: ignore[reportAttributeAccessIssue, reportArgumentType]
-        resolution=z.attrs["resolution"],  # pyright: ignore[reportAttributeAccessIssue, reportArgumentType]
-        area_extent=tuple(z.attrs["area_extent"]),  # pyright: ignore[reportAttributeAccessIssue, reportArgumentType]
-        width=z.attrs["width"],  # pyright: ignore[reportAttributeAccessIssue, reportArgumentType]
-        height=z.attrs["height"],  # pyright: ignore[reportAttributeAccessIssue, reportArgumentType]
-        zarr_path=zarr_path,
-        source_shape=source_shape,
-    )
-
-    return lut_meta, z
+    return load_lut(lut_path)
 
 
-def list_available_utm_zones(lut_dir: Path) -> list[tuple[int, int]]:
-    available = []
-    base_dir = Path(lut_dir)
-    if not base_dir.exists():
-        return available
-
-    for epsg_dir in base_dir.iterdir():
-        if not epsg_dir.is_dir() or not epsg_dir.name.isdigit():
-            continue
-
-        epsg = int(epsg_dir.name)
-        for res_dir in epsg_dir.glob("*m.zarr"):
-            res_str = res_dir.name.replace("m.zarr", "")
-            if res_str.isdigit():
-                available.append((epsg, int(res_str)))
-
-    return sorted(available)
-
-
-def detect_goes_utm_zones(source_area_def: AreaDefinition) -> list[int]:
-    crswgs84 = pyproj.CRS("EPSG:4326")
-
-    if hasattr(source_area_def, "crs") and source_area_def.crs is not None:
-        src_crs = pyproj.CRS(source_area_def.crs)
-    elif hasattr(source_area_def, "proj_dict"):
-        src_crs = pyproj.CRS(source_area_def.proj_dict)
-    else:
-        raise ValueError("Cannot determine CRS from source_area_def")
-
-    transformer = pyproj.Transformer.from_crs(src_crs, crswgs84, always_xy=True)
-
-    minx, miny, maxx, maxy = source_area_def.area_extent
-    xs = np.linspace(minx, maxx, 100)
-    ys = np.linspace(miny, maxy, 100)
-    xv, yv = np.meshgrid(xs, ys)
-    lons, lats = transformer.transform(xv.ravel(), yv.ravel())
-
-    valid = np.isfinite(lons) & np.isfinite(lats)
-    valid_lons = lons[valid]
-    valid_lats = lats[valid]
-
-    if len(valid_lons) == 0:
-        return []
-
-    goes_min_lon, goes_max_lon = np.min(valid_lons), np.max(valid_lons)
-    goes_min_lat, goes_max_lat = np.min(valid_lats), np.max(valid_lats)
-
-    goes_min_lon -= 1
-    goes_max_lon += 1
-    goes_min_lat -= 1
-    goes_max_lat += 1
-
-    utm_zones = []
-
-    # North
-    for z in range(1, 61):
-        epsg = 32600 + z
-        crs = pyproj.CRS.from_epsg(epsg)
-        area = crs.area_of_use
-        if area:
-            west, south, east, north = area.bounds
-
-            # Simple bounding box overlap logic
-            # Be careful with 180/-180 wrap, but for geostationary usually ok if simple
-            # Since going to WGS84, handle if GOES extends over antimeridian
-
-            if goes_min_lon <= east and goes_max_lon >= west and goes_min_lat <= north and goes_max_lat >= south:
-                utm_zones.append(epsg)
-
-    # South
-    for z in range(1, 61):
-        epsg = 32700 + z
-        crs = pyproj.CRS.from_epsg(epsg)
-        area = crs.area_of_use
-        if area:
-            west, south, east, north = area.bounds
-            if goes_min_lon <= east and goes_max_lon >= west and goes_min_lat <= north and goes_max_lat >= south:
-                utm_zones.append(epsg)
-
-    return sorted(utm_zones)
-
-
-def compute_cell_slice(
-    cell_utm_footprint_bounds: tuple[float, float, float, float],
-    lut_area_extent: tuple[float, float, float, float],
-    resolution: int,
-    target_width: int | None = None,
-    target_height: int | None = None,
-) -> tuple[slice, slice, tuple[float, float, float, float]]:
-    """Compute row/col slices within a UTM zone LUT for a grid cell.
-
-    Given the UTM footprint bounds of a grid cell and the area extent
-    of the full UTM zone LUT, return (row_slice, col_slice, effective_extent)
-    to extract exactly the grid cell's region from the LUT arrays.
-
-    The ``effective_extent`` is the area extent of the returned slice,
-    snapped to the LUT's pixel grid. Use this (not the original cell
-    bounds) when writing GeoTIFFs to ensure that pixel values and
-    geospatial metadata are consistent.
-
-    Args:
-        cell_utm_footprint_bounds: Bounds of the grid cell in its UTM CRS (meters).
-        lut_area_extent: Full extent of the UTM zone LUT (meters).
-        resolution: Pixel size in meters.
-        target_width: Optional forced width in pixels. Avoids fencepost errors.
-        target_height: Optional forced height in pixels.
-
-    Returns:
-        Tuple of (row_slice, col_slice, effective_extent).
-            - row_slice, col_slice: Slices into the 2D LUT grid.
-            - effective_extent (tuple): (minx, miny, maxx, maxy) of the slice on the LUT grid.
-    """
-    lut_minx, lut_miny, _, lut_maxy = lut_area_extent
-    cell_minx, cell_miny, cell_maxx, cell_maxy = cell_utm_footprint_bounds
-    lut_height = int(round((lut_maxy - lut_miny) / resolution))
-
-    if target_width is not None and target_height is not None:
-        # Anchor start positions via floor to avoid sub-pixel drift,
-        # then derive end = start + target dimension for exact size.
-        col_start = int(math.floor((cell_minx - lut_minx) / resolution))
-        col_end = col_start + target_width
-
-        row_end_from_bottom = int(math.floor((cell_miny - lut_miny) / resolution))
-        row_end = lut_height - row_end_from_bottom
-        row_start = row_end - target_height
-    else:
-        # Legacy path: round both boundaries independently
-        col_start = int(round((cell_minx - lut_minx) / resolution))
-        col_end = int(round((cell_maxx - lut_minx) / resolution))
-
-        row_start = lut_height - int(round((cell_maxy - lut_miny) / resolution))
-        row_end = lut_height - int(round((cell_miny - lut_miny) / resolution))
-
-    # Compute the effective area_extent on the LUT grid
-    eff_minx = lut_minx + col_start * resolution
-    eff_maxx = lut_minx + col_end * resolution
-    eff_maxy = lut_maxy - row_start * resolution
-    eff_miny = lut_maxy - row_end * resolution
-    effective_extent = (eff_minx, eff_miny, eff_maxx, eff_maxy)
-
-    return slice(row_start, row_end), slice(col_start, col_end), effective_extent
-
-
-def compute_source_crop_slices(
-    valid_input_index: np.ndarray,
-    source_shape: tuple[int, int],
-) -> tuple[slice, slice, np.ndarray, np.ndarray]:
-    """Compute the minimal bounding-box crop of the GOES source grid.
-
-    Uses the valid_input_index boolean mask to find participating source pixels,
-    then returns slices for the tightest 2D crop containing all of them.
-
-    Args:
-        valid_input_index: 1D boolean array of length source_height * source_width.
-        source_shape: (height, width) of the source GOES image.
-
-    Returns:
-        Tuple containing:
-            - row_slice: Slice into source rows.
-            - col_slice: Slice into source columns.
-            - row_offsets: Row indices of valid pixels relative to crop origin.
-            - col_offsets: Column indices of valid pixels relative to crop origin.
-    """
-    mask_2d = valid_input_index.reshape(source_shape)
-    rows_2d, cols_2d = np.where(mask_2d)
-
-    row_min, row_max = int(rows_2d.min()), int(rows_2d.max())
-    col_min, col_max = int(cols_2d.min()), int(cols_2d.max())
-
-    row_slice = slice(row_min, row_max + 1)
-    col_slice = slice(col_min, col_max + 1)
-
-    # Offsets within the crop
-    row_offsets = rows_2d - row_min
-    col_offsets = cols_2d - col_min
-
-    return row_slice, col_slice, row_offsets, col_offsets
-
-
-def read_goes_crop(
-    nc_path: str | Path,
+def apply_lut(
+    source_crop: np.ndarray,
+    lut: UTMZoneLUT,
     row_slice: slice,
     col_slice: slice,
-    variable: str = "Rad",
-    apply_scale_offset: bool = True,
-) -> np.ndarray:
-    """Read a 2D crop from a GOES NetCDF file using h5py.
+):
+    row = lut.row_map[row_slice, col_slice]
+    col = lut.col_map[row_slice, col_slice]
 
-    Args:
-        nc_path: Path to the GOES .nc file.
-        row_slice, col_slice: Slices into the source raster.
-        variable: HDF5 variable name.
-        apply_scale_offset: If True, apply scale_factor and add_offset attributes.
+    valid = row >= 0
 
-    Returns:
-        2D float32 array of shape (row_slice height, col_slice width).
-    """
-    import h5py
+    out = np.full(row.shape, np.nan, dtype=np.float32)
+    out[valid] = source_crop[row[valid], col[valid]]
 
-    with h5py.File(str(nc_path), "r") as f:
-        var = f[variable]
-        crop = var[row_slice, col_slice]  # type: ignore[index]
-        if apply_scale_offset and "scale_factor" in var.attrs:
-            crop = crop.astype(np.float32) * var.attrs["scale_factor"][0] + var.attrs["add_offset"][0]  # pyright: ignore[reportAttributeAccessIssue, reportIndexIssue]
-        else:
-            crop = crop.astype(np.float32)  # pyright: ignore[reportAttributeAccessIssue]
-    return cast(np.ndarray, crop)
+    return out
+
+
+def list_available_utm_zones(lut_dir: str | Path) -> list[tuple[int, int]]:
+    available = []
+    if not uri_exists(lut_dir):
+        return available
+
+    fs, base_path = fsspec.core.url_to_fs(str(lut_dir))
+
+    try:
+        # Details=False returns a list of strings
+        for epsg_path in fs.ls(base_path, detail=False):
+            epsg_name = os.path.basename(epsg_path.rstrip("/"))
+            if not epsg_name.isdigit():
+                continue
+
+            epsg = int(epsg_name)
+            # In some fsspec implementations, ls might not be recursive, so we check one level down
+            for res_path in fs.ls(epsg_path, detail=False):
+                res_name = os.path.basename(res_path.rstrip("/"))
+                if res_name.endswith("m.npz"):
+                    res_str = res_name.replace("m.npz", "")
+                    if res_str.isdigit():
+                        available.append((epsg, int(res_str)))
+    except Exception as e:
+        logger.warning("Failed to list available UTM zones", error=str(e), path=str(lut_dir))
+
+    return sorted(list(set(available)))
+
+
+from pyresample.area_config import load_area_from_string
 
 
 def extract_cell_from_lut(
-    source_crop: np.ndarray,
-    row_offsets: np.ndarray,
-    col_offsets: np.ndarray,
-    lut_group: zarr.Group,
-    cell_row_slice: slice,
-    cell_col_slice: slice,
-    lut_width: int,
-) -> np.ndarray:
-    """Extract a grid cell's data using pre-computed LUT arrays.
+    source_crop: xr.DataArray,
+    grid_cell: GridCell,
+    lut: UTMZoneLUT,
+) -> xr.DataArray:
+    utm_bounds = grid_cell.utm_footprint.bounds
+    # area_def = grid_cell.area_def(lut.resolution)
+    area_def = load_area_from_string(grid_cell.area_def(lut.resolution).to_yaml())
+    row_sl, col_sl, eff_bounds = compute_cell_slice(
+        utm_bounds, lut.area_extent, lut.resolution, area_def.height, area_def.width
+    )
+    tile = apply_lut(source_crop.values, lut, row_sl, col_sl)
 
-    Args:
-        source_crop: 2D cropped source region.
-        row_offsets, col_offsets: Coordinate arrays from compute_source_crop_slices.
-        lut_group: Zarr group with valid_output_index and index_array.
-        cell_row_slice, cell_col_slice: Slices within the full UTM zone LUT grid.
-        lut_width: Full dimensions of the UTM zone grid.
+    minx, miny, maxx, maxy = eff_bounds
+    cell_w = col_sl.stop - col_sl.start
+    cell_h = row_sl.stop - row_sl.start
 
-    Returns:
-        2D float32 array of shape (cell_height, cell_width).
-    """
-    cell_height = cell_row_slice.stop - cell_row_slice.start
-    cell_width = cell_col_slice.stop - cell_col_slice.start
+    # Coordinates (centers of the pixels, descending y)
+    x_coords, y_coords = area_def.get_proj_vectors()
 
-    # Build flat index mask for the cell region within the full LUT
-    rows = np.arange(cell_row_slice.start, cell_row_slice.stop)
-    cols = np.arange(cell_col_slice.start, cell_col_slice.stop)
-    row_grid, col_grid = np.meshgrid(rows, cols, indexing="ij")
-    flat_indices = (row_grid * lut_width + col_grid).ravel()
+    da = xr.DataArray(
+        tile.astype(np.float32),
+        coords={"y": y_coords, "x": x_coords},
+        dims=("y", "x"),
+        name="goes_data",
+    )
 
-    # Load only the needed LUT chunks from Zarr
-    valid_output = np.asarray(lut_group["valid_output_index"][flat_indices]).astype(bool)
-    index_arr = np.asarray(lut_group["index_array"][flat_indices])
+    # Set CRS and transform using rioxarray conventions
+    da.rio.write_crs(f"EPSG:{lut.utm_epsg}", inplace=True)
+    dst_transform = from_bounds(*area_def.area_extent, cell_w, cell_h)
+    da.rio.write_transform(dst_transform, inplace=True)
 
-    # Gather valid input pixels from the crop (compressed valid-input space)
-    # source_crop[row_offsets, col_offsets] yields exactly the pixels where
-    # valid_input_index is True, in flat order — matching pyresample convention.
-    valid_source_pixels = source_crop[row_offsets, col_offsets]
-
-    # Apply the LUT: index_array values index into valid_source_pixels
-    result = np.full(cell_height * cell_width, np.nan, dtype=np.float32)
-    result[valid_output] = valid_source_pixels[index_arr[valid_output]]
-
-    return result.reshape(cell_height, cell_width)
+    return da

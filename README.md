@@ -54,7 +54,7 @@ artifacts_df = extractor.extract_batches(tasks, extract_params={"max_workers": 8
 This plugin includes a high-performance extraction engine that uses pre-computed **Look-Up Tables (LUTs)** to achieve near-zero projection overhead during extraction.
 
 #### Features
-- **Zero Reprojection**: Uses pre-calculated nearest-neighbor indices stored in Zarr format.
+- **Zero Reprojection**: Uses pre-calculated nearest-neighbor indices stored in NumPy .npz format.
 - **Lazy Loading**: Only the chunks of the LUT covering your specific Area of Interest (AOI) are loaded.
 - **Auto-Download**: If a LUT for a specific UTM Zone and resolution is missing locally, the plugin automatically fetches it from the GitHub Release assets.
 - **Scientific Parity**: Achieving identical results to Satpy's nearest-neighbor resampling through precision integer-based coordinate slicing.
@@ -74,16 +74,30 @@ artifacts_df = extractor.extract(
 ```
 
 #### LUT Distribution
-LUTs are organized as zipped Zarr directories and published as assets in the GitHub Releases. 
+LUTs are organized as zipped .npz files and published as assets in the GitHub Releases. 
 
 By default, **the plugin handles everything automatically**. When you request an extraction, it dynamically identifies the satellite and product combination (e.g., `goes19_radf`), checks if you have the required LUT locally, and downloads the ZIP from the latest GitHub release if missing. It extracts the files directly to your cache directory (default `~/.cache/aer/extract-aws-goes/luts`).
 
 **Offline Environments / Manual Setup:**
 If you are running the extractor in an air-gapped environment or want to pre-seed your cache:
-1. Navigate to the [Releases page](https://github.com/frandorr/aer-extract-aws-goes/releases) and download the required ZIP files (e.g., `goes19_radf_32720_1000m.zarr.zip`).
-2. Unzip the contents into your `lut_dir`. The structure must match: `<lut_dir>/<combo>/<utm_epsg>/<resolution>m.zarr`. 
-   *(Example: `~/.cache/aer/extract-aws-goes/luts/goes19_radf/32720/1000m.zarr`)*
+1. Navigate to the [Releases page](https://github.com/frandorr/aer-extract-aws-goes/releases) and download the required ZIP files (e.g., `goes19_radf_32720_1000m.npz.zip`).
+2. Unzip the contents into your `lut_dir`. The structure must match: `<lut_dir>/<combo>/<utm_epsg>/<resolution>m.npz`. 
+   *(Example: `~/.cache/aer/extract-aws-goes/luts/goes19_radf/32720/1000m.npz`)*
 3. Run your extraction. The system will detect the local directory and skip the download.
+
+#### Generating Custom LUTs
+If you need to generate LUTs for a specific UTM zone or resolution not available in the official releases:
+
+```bash
+# Install the package and run the generator
+generate-luts \
+    --goes-file /path/to/OR_ABI-L1b-RadF-M6C01_G19_s202312312345678.nc \
+    --output-dir ./luts \
+    --resolutions 500 1000 2000 \
+    --utm-zones 32620 32621
+```
+
+The generator will print a JSON snippet at the end. Add this snippet to `components/aer/extract_aws_goes/data/lut_config.json` to enable the "zero-S3-read" optimization for the new LUTs.
 
 ---
 

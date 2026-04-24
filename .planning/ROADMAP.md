@@ -59,12 +59,12 @@ Plans:
   - [x] Resample once per UTM group.
   - [x] Verify with mock tests and baseline tests.
 
-### Phase 8: UTM zone lookup table extraction engine (Status: Planned)
+### Phase 8: UTM zone lookup table extraction engine (Status: Complete)
 
-**Goal:** Create a GOES extractor that uses pre-computed UTM zone lookup tables to eliminate runtime reprojection entirely. Offline: compute GOES→UTM reprojection indices for each UTM zone at multiple resolutions (500m, 1000m, 2000m) and store them as chunked, fast-access Zarr arrays. Online: given a grid_cell, load the corresponding UTM zone LUT and extract the sub-region by simple index slicing — no reprojection needed.
+**Goal:** Create a GOES extractor that uses pre-computed UTM zone lookup tables to eliminate runtime reprojection entirely. Data is split between a tiny local `lut_config.json` (for zero-S3-read initial cropping) and a large remote Zarr store (for 2D chunked indexing and pre-loaded offsets).
 **Requirements**: REQ-08.1, REQ-08.2, REQ-08.3, REQ-08.4
 **Depends on:** Phase 7
-**Plans:** 0 plans
+**Plans:** 1/1 plans complete
 
 Plans:
-- [ ] TBD (run /gsd-plan-phase 8 to break down)
+- [x] Refactor LUT storage: Split local config and S3 Zarr (Done)

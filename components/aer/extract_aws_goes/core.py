@@ -27,22 +27,13 @@ except ImportError:
     gdal = None
     osr = None
 
+from .utils import (
+    detect_reader,
+    detect_combo,
+    map_channel_ids_to_satpy_names,
+)
+
 logger = get_logger()
-
-L1B_PATTERN = re.compile(r"ABI-L1b-Rad[CF]")
-L2_AOD_PATTERN = re.compile(r"ABI-L2-AOD[CF]")
-L2_BRF_PATTERN = re.compile(r"ABI-L2-BRF[CF]")
-
-
-def detect_reader(filename: str) -> str | None:
-    """Detect the satpy reader based on the GOES filename."""
-    if L1B_PATTERN.search(filename):
-        return "abi_l1b"
-    if L2_BRF_PATTERN.search(filename):
-        return "abi_l2_brf_nc"
-    if L2_AOD_PATTERN.search(filename):
-        return "abi_l2_nc"
-    return None
 
 
 def _extract_wrapper(args):
@@ -52,23 +43,6 @@ def _extract_wrapper(args):
 
     instance = AwsGoesExtractor()
     return instance.extract(batch, extract_params)
-
-
-def map_channel_ids_to_satpy_names(channel_ids: set[str], available_names: set[str]) -> list[str]:
-    """Map channel IDs to satpy dataset names.
-
-    Handles direct matches ('C01' in available) and numeric IDs
-    ('1' -> 'C01', '13' -> 'C13').
-    """
-    result: list[str] = []
-    for cid in channel_ids:
-        if cid in available_names:
-            result.append(cid)
-        elif cid.isdigit():
-            padded = f"C{int(cid):02d}"
-            if padded in available_names:
-                result.append(padded)
-    return result
 
 
 SUPPORTED_COLLECTIONS: Sequence[str] = [
@@ -266,7 +240,7 @@ class AwsGoesExtractor(Extractor, plugin_abstract=False):
             extraction_task: The task containing assets and grid cells to extract.
             extract_params: Dictionary of parameters.
                 Required:
-                    lut_dir (str): Path to root LUT directory containing Zarr stores.
+                    lut_dir (str): Path to root LUT directory containing .npz files.
                 Optional:
                     calibration (str): 'radiance', 'reflectance', or 'brightness_temperature'
                         (default: 'counts').
@@ -326,10 +300,11 @@ class AwsGoesExtractor(Extractor, plugin_abstract=False):
         # Group grid cells by UTM zone for LUT loading
         from collections import defaultdict
         from aer.extract_aws_goes.lut import (
-            compute_cell_slice,
-            compute_source_crop_slices,
             extract_cell_from_lut,
             load_utm_zone_lut,
+        )
+        from .utils import (
+            compute_cell_slice,
             read_goes_crop,
         )
 
@@ -340,42 +315,36 @@ class AwsGoesExtractor(Extractor, plugin_abstract=False):
 
         for utm_epsg, group_cells in utm_groups.items():
             try:
-                # Detect combo (e.g. goes19_radf) for auto-download
+                # Detect combo (e.g. goes_east_radf) for auto-download
                 combo = self._detect_combo(href)
 
-                # Load UTM zone LUT (lazy Zarr group, mapping from bucket)
-                lut_info, lut_group = load_utm_zone_lut(bucket_uri, utm_epsg, int(resolution), combo=combo)
-                lut_extent = lut_info.area_extent
-                lut_width = lut_info.width
+                # Load UTM zone LUT metadata and arrays from .npz
+                # crop_slices are stored in the .npz and loaded into lut
+                lut = load_utm_zone_lut(bucket_uri, utm_epsg, int(resolution), combo=combo)
+                lut_extent = lut.area_extent
+                crop_slices = lut.crop_slices
 
-                # Compute the minimal crop of the GOES source needed for this UTM zone
-                valid_input_index = np.asarray(lut_group["valid_input_index"][:])
-                source_shape = lut_info.source_shape
-                if source_shape is None:
-                    raise ValueError(
-                        f"LUT for EPSG:{utm_epsg} missing source_shape; "
-                        "regenerate with the latest generate_utm_zone_lut"
-                    )
-                src_row_sl, src_col_sl, row_offsets, col_offsets = compute_source_crop_slices(
-                    valid_input_index, source_shape
-                )
+                if crop_slices is None:
+                    raise ValueError(f"No crop_slices found for EPSG:{utm_epsg} {resolution}m in .npz metadata")
+
+                src_row_sl = slice(crop_slices[0], crop_slices[1])
+                src_col_sl = slice(crop_slices[2], crop_slices[3])
+
                 # Read only the needed crop from the GOES file via h5py
                 apply_scale_offset = calibration != "counts"
                 source_crop = read_goes_crop(
                     local_path, src_row_sl, src_col_sl, variable=var_name, apply_scale_offset=apply_scale_offset
                 )
+
                 logger.info(
                     "source_crop_loaded",
                     utm_epsg=utm_epsg,
                     crop_shape=source_crop.shape,
-                    full_shape=source_shape,
                 )
 
                 def _extract_one(gc_):
                     try:
                         bounds = gc_.utm_footprint.bounds  # (minx, miny, maxx, maxy)
-                        # Use area_def dimensions as authoritative pixel counts to avoid
-                        # fencepost errors from non-aligned UTM footprint bounds.
                         area_def = gc_.area_def(int(resolution))
                         row_sl, col_sl, eff_extent = compute_cell_slice(
                             bounds,
@@ -387,12 +356,9 @@ class AwsGoesExtractor(Extractor, plugin_abstract=False):
 
                         cell_data = extract_cell_from_lut(
                             source_crop,
-                            row_offsets,
-                            col_offsets,
-                            lut_group,
+                            lut,
                             row_sl,
                             col_sl,
-                            lut_width,
                         )
 
                         # Apply calibration
@@ -644,7 +610,7 @@ class AwsGoesExtractor(Extractor, plugin_abstract=False):
                         else:
                             import rasterio
                             from rasterio.transform import from_bounds
-                            from aer.extract_aws_goes.lut import compute_cell_slice
+                            from .utils import compute_cell_slice
 
                             cell_area_def = gc_.area_def(int(resolution))
                             row_sl, col_sl, eff_extent = compute_cell_slice(
@@ -737,161 +703,6 @@ class AwsGoesExtractor(Extractor, plugin_abstract=False):
 
     # ── Helpers ───────────────────────────────
 
-    @staticmethod
-    def _detect_combo(href: str) -> str:
-        """Detect the satellite/product combo from a GOES filename.
-
-        Uses orbital-position-based naming so satellites at the same position
-        (and therefore with identical geostationary area definitions) share LUTs:
-          - GOES-16 and GOES-19 → ``goes_east``  (75.2 °W)
-          - GOES-17 and GOES-18 → ``goes_west``  (137.2 °W)
-
-        Example: ...OR_ABI-L1b-RadF-M6C01_G19... → goes_east_radf
-        """
-        name = Path(href).name.lower()
-
-        # Map satellite number → orbital position.
-        # GOES-16/19 are at the East slot; GOES-17/18 are at the West slot.
-        if "g16" in name or "g19" in name:
-            sat = "goes_east"
-        elif "g17" in name or "g18" in name:
-            sat = "goes_west"
-        else:
-            sat = "unknown"
-
-        # Product/Domain
-        if "radf" in name:
-            prod = "radf"
-        elif "radc" in name:
-            prod = "radc"
-        elif "radm" in name:
-            prod = "radm"
-        else:
-            prod = "unknown"
-
-        return f"{sat}_{prod}"
-
-    @staticmethod
-    def _detect_subdataset(nc_path: str, channel_id: str) -> str:
-        """Detect the right GDAL subdataset URI for a GOES NetCDF.
-
-        For L1b products: NETCDF:"file.nc":Rad
-        For L2 BRF:       NETCDF:"file.nc":BRF
-        For L2 AOD:       NETCDF:"file.nc":AOD
-        """
-        # Do not use gdal.Open or rasterio.open on the root NetCDF here because
-        # it can trigger HDF5 warnings/errors that escalate to segfaults.
-        base_name = set(nc_path.split("/")[-1].split("_"))
-        if any("L2-AOD" in p for p in base_name):
-            return f'NETCDF:"{nc_path}":AOD'
-        elif any("L2-BRF" in p for p in base_name):
-            return f'NETCDF:"{nc_path}":BRF'
-        elif any("L2-SST" in p for p in base_name):
-            return f'NETCDF:"{nc_path}":SST'
-        elif any("L2-TPW" in p for p in base_name):
-            return f'NETCDF:"{nc_path}":TPW'
-
-        # Default for L1b is Rad
-        return f'NETCDF:"{nc_path}":Rad'
-
-    @staticmethod
-    def _read_abi_calibration_params(nc_path: str) -> dict[str, Any]:
-        """Read ABI calibration constants from a GOES NetCDF file.
-
-        Args:
-            nc_path: Path to the GOES .nc file.
-
-        Returns:
-            Dict with keys needed for VIS reflectance and IR BT conversion:
-                - esun: Band solar irradiance (W m^-2 um^-1).
-                - esd: Earth-sun distance anomaly (AU).
-                - planck_fk1: Planck function constant 1 (IR only).
-                - planck_fk2: Planck function constant 2 (IR only).
-                - planck_bc1: Planck bias correction 1 (IR only).
-                - planck_bc2: Planck bias correction 2 (IR only).
-        """
-        import xarray as xr
-
-        # Strip the "netcdf:...:Rad" GDAL URI prefix if present
-        clean_path = nc_path
-        if clean_path.lower().startswith("netcdf:"):
-            # Format is typically NETCDF:"/path/to/file.nc":Rad
-            parts = clean_path.split(":")
-            # If path has no colons inside, parts[1] is the quoted path.
-            # actually we can just strip prefix and suffix
-            clean_path = clean_path[7:]  # remove NETCDF:
-            if ":" in clean_path:
-                clean_path = clean_path.rsplit(":", 1)[0]  # remove :Rad
-            clean_path = clean_path.strip("\"'")
-
-        ds = xr.open_dataset(clean_path, mask_and_scale=False)
-        params: dict[str, Any] = {}
-        for key in (
-            "esun",
-            "earth_sun_distance_anomaly_in_AU",
-            "planck_fk1",
-            "planck_fk2",
-            "planck_bc1",
-            "planck_bc2",
-        ):
-            if key in ds:
-                params[key] = float(ds[key].values)
-        ds.close()
-        return params
-
-    @staticmethod
-    def _apply_abi_calibration(
-        data: np.ndarray,
-        calibration: str,
-        cal_params: dict[str, Any],
-    ) -> np.ndarray:
-        """Apply ABI radiometric calibration to a warped radiance array.
-
-        Args:
-            data: Float32 radiance array (already scale+offset applied by GDAL).
-            calibration: Type of calibration to apply.
-                - 'radiance': No-op, return as-is.
-                - 'reflectance': VIS calibration -> TOA reflectance (%).
-                - 'brightness_temperature': IR Planck inversion -> BT in Kelvin.
-            cal_params: Dict from _read_abi_calibration_params.
-
-        Returns:
-            Calibrated array.
-        """
-        if calibration in ("radiance", "counts"):
-            return data
-
-        if calibration == "reflectance":
-            esun = cal_params.get("esun")
-            esd = cal_params.get("earth_sun_distance_anomaly_in_AU")
-            if esun is None or esd is None:
-                raise ValueError(
-                    "'esun' and 'earth_sun_distance_anomaly_in_AU' must be present in "
-                    "the NetCDF for reflectance calibration (VIS channels C01-C06 only)."
-                )
-            # Satpy formula: refl = (π * esd² / esun) * Rad  →  multiply by 100 for %
-            factor = np.float32(np.pi * esd * esd / esun)
-            return np.where(np.isnan(data), np.nan, data * factor * 100.0).astype(np.float32)
-
-        if calibration == "brightness_temperature":
-            fk1 = cal_params.get("planck_fk1")
-            fk2 = cal_params.get("planck_fk2")
-            bc1 = cal_params.get("planck_bc1")
-            bc2 = cal_params.get("planck_bc2")
-            if any(v is None for v in (fk1, fk2, bc1, bc2)):
-                raise ValueError(
-                    "Planck constants (planck_fk1/fk2/bc1/bc2) must be present in the "
-                    "NetCDF for brightness_temperature calibration (IR channels C07-C16 only)."
-                )
-            # Satpy formula: BT = (fk2 / ln(fk1 / Rad + 1) - bc1) / bc2
-            with np.errstate(divide="ignore", invalid="ignore"):
-                bt = (fk2 / np.log(np.float32(fk1) / data + 1.0) - np.float32(bc1)) / np.float32(bc2)
-            return np.where(np.isnan(data) | (data <= 0), np.nan, bt).astype(np.float32)
-
-        raise ValueError(
-            f"Unknown calibration '{calibration}'. Choose from: 'radiance', 'reflectance', 'brightness_temperature'."
-        )
-
     @override
     def extract_batches(
         self,
@@ -928,3 +739,8 @@ class AwsGoesExtractor(Extractor, plugin_abstract=False):
         concatenated = pd.concat(results, ignore_index=True)
         validated = ArtifactSchema.validate(concatenated)
         return cast(GeoDataFrame[ArtifactSchema], validated)
+
+    @staticmethod
+    def _detect_combo(href: str) -> str:
+        """Helper to detect combo from href using utils."""
+        return detect_combo(href)
