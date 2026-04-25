@@ -2,7 +2,6 @@ import unittest
 import pytest
 from unittest.mock import MagicMock, patch, PropertyMock
 import tempfile
-import numpy as np
 import pandas as pd
 import geopandas as gpd
 from shapely.geometry import box
@@ -13,19 +12,17 @@ from aer.interfaces import ExtractionTask
 class TestUtmGrouping(unittest.TestCase):
     @pytest.mark.slow
     @patch("s3fs.S3FileSystem")
-    @patch("aer.extract_aws_goes.core.Scene")
-    def test_extract_groups_by_utm(self, mock_scene_cls, mock_s3):
+    @patch("aer.extract_aws_goes.core.read_goes_crop")
+    @patch("aer.extract_aws_goes.lut.load_utm_zone_lut")
+    @patch("aer.extract_aws_goes.utils.download_lut_if_needed")
+    def test_extract_groups_by_utm(self, mock_download, mock_load_lut, mock_read_crop, mock_s3):
         # Setup mocks
-        mock_scene = mock_scene_cls.return_value
-        mock_scene.available_dataset_names.return_value = ["C01"]
-
-        # Mock resampled dataset with real numpy data
+        mock_lut = MagicMock()
+        mock_lut.crop_slices = (0, 10, 0, 10)
+        mock_load_lut.return_value = mock_lut
+        mock_read_crop.return_value = MagicMock()
         mock_da = MagicMock()
-        mock_da.values = np.ones((10, 10), dtype=np.float32)
-        mock_da.rio.write_crs.return_value = mock_da
-
-        mock_resampled_scene = {"C01": mock_da}
-        mock_scene.resample.return_value = mock_resampled_scene
+        mock_da.rio.to_raster = MagicMock()
 
         # Create assets
         assets = gpd.GeoDataFrame(
@@ -82,20 +79,19 @@ class TestUtmGrouping(unittest.TestCase):
                 rio_open_calls.append(args)
                 return original_open(*args, **kwargs)
 
-            with patch.object(_real_rasterio, "open", side_effect=tracking_open):
-                with patch(
-                    "aer.interfaces.core.ExtractionTask.overlapping_grid_cells", new_callable=PropertyMock
-                ) as mock_overlap:
+            with patch("aer.interfaces.core.ExtractionTask.overlapping_grid_cells", new_callable=PropertyMock) as mock_overlap:
+                with patch("aer.extract_aws_goes.lut.extract_cell_from_lut") as mock_extract_cell:
+                    mock_extract_cell.return_value = mock_da
                     mock_overlap.return_value = [gc1, gc2, gc3]
                     extractor = AwsGoesExtractor()
                     with patch("aer.extract_aws_goes.core.ArtifactSchema.validate", side_effect=lambda x: x):
                         result = extractor.extract(task, extract_params={"engine": "satpy"})
 
-            # Verify resample calls: should be 2 (one for EPSG:32610, one for EPSG:32611)
-            self.assertEqual(mock_scene.resample.call_count, 2)
-
-            # Verify rasterio.open calls: should be 3 (one per grid cell)
-            self.assertEqual(len(rio_open_calls), 3)
+            # Verify read_goes_crop calls: should be 2 (one for EPSG:32610, one for EPSG:32611)
+            self.assertEqual(mock_read_crop.call_count, 2)
+            
+            # Verify extract_cell_from_lut calls: should be 3 (one per grid cell)
+            self.assertEqual(mock_extract_cell.call_count, 3)
 
             # Verify artifact rows
             self.assertEqual(len(result), 3)

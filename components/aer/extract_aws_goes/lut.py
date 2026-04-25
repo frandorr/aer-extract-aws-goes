@@ -28,7 +28,7 @@ DEFAULT_RADIUS_OF_INFLUENCE = 50_000  # meters, for pyresample kd-tree search
 
 def get_default_bucket_uri() -> str:
     """Return the default Hugging Face bucket URI for LUTs."""
-    return "hf://datasets/frandorr/aer-data/luts"
+    return "hf://buckets/frandorr/aer-data/luts"
 
 
 def uri_exists(uri: str | Path) -> bool:
@@ -81,6 +81,8 @@ def generate_utm_zone_lut(goes_path: Path, utm_epsg: int, resolution: int, outpu
         resolution: The resolution.
         output_uri: URI to save the LUT to. If None, the LUT will not be saved.
     """
+    import gc
+
     # if output_uri is not None check if file already exist and return loading the lut
     sat_info = parse_goes_filename(str(goes_path))
     if output_uri is not None:
@@ -103,28 +105,43 @@ def generate_utm_zone_lut(goes_path: Path, utm_epsg: int, resolution: int, outpu
     )
 
     valid_input_index, valid_output_index, index_array, _ = get_neighbour_info(
-        source_area_def, target_area_def, radius_of_influence=DEFAULT_RADIUS_OF_INFLUENCE, neighbours=1, nprocs=-1
+        source_area_def, target_area_def, radius_of_influence=DEFAULT_RADIUS_OF_INFLUENCE, neighbours=1, nprocs=1
     )
 
+    # Free area defs immediately — no longer needed
+    del target_area_def
+
     source_shape = (source_area_def.height, source_area_def.width)
+    del source_area_def
+
     row_sl, col_sl, row_offsets, col_offsets = compute_source_crop_slices(valid_input_index, source_shape)
 
     n_valid_in = int(valid_input_index.sum())
     n_target = height * width
+
+    # Free the large boolean mask
+    del valid_input_index
 
     row_map = np.full(n_target, -1, dtype=np.int16)
     col_map = np.full(n_target, -1, dtype=np.int16)
 
     # Flat indices into the target grid that have a valid neighbor
     valid_out_flat = np.flatnonzero(valid_output_index)
+    del valid_output_index
 
     # Guard against fill values (index == n_valid_in means no valid neighbor)
     valid_ia_mask = index_array < n_valid_in
     valid_out_with_neighbor = valid_out_flat[valid_ia_mask]
     ia_clipped = index_array[valid_ia_mask]
 
+    # Free intermediates
+    del valid_out_flat, valid_ia_mask, index_array
+
     row_map[valid_out_with_neighbor] = row_offsets[ia_clipped].astype(np.int16)
     col_map[valid_out_with_neighbor] = col_offsets[ia_clipped].astype(np.int16)
+
+    # Free offset arrays
+    del valid_out_with_neighbor, ia_clipped, row_offsets, col_offsets
 
     row_map_2d = row_map.reshape(height, width)
     col_map_2d = col_map.reshape(height, width)
@@ -136,7 +153,7 @@ def generate_utm_zone_lut(goes_path: Path, utm_epsg: int, resolution: int, outpu
         width=width,
         height=height,
         crop_slices=(row_sl.start, row_sl.stop, col_sl.start, col_sl.stop),
-        source_shape=(source_area_def.height, source_area_def.width),
+        source_shape=source_shape,
         row_map=row_map_2d,
         col_map=col_map_2d,
         satellite=sat_info.get("sat", ""),
@@ -149,6 +166,7 @@ def generate_utm_zone_lut(goes_path: Path, utm_epsg: int, resolution: int, outpu
     if output_uri is not None:
         save_utm_zone_lut(utm_zone_lut)
 
+    gc.collect()
     return utm_zone_lut
 
 
@@ -303,11 +321,41 @@ def extract_cell_from_lut(
     row_sl, col_sl, eff_bounds = compute_cell_slice(
         utm_bounds, lut.area_extent, lut.resolution, area_def.height, area_def.width
     )
-    tile = apply_lut(source_crop.values, lut, row_sl, col_sl)
 
-    minx, miny, maxx, maxy = eff_bounds
-    cell_w = col_sl.stop - col_sl.start
-    cell_h = row_sl.stop - row_sl.start
+    target_h = area_def.height
+    target_w = area_def.width
+
+    # Clamp slices to valid LUT array bounds.  Grid cells at the edges of
+    # a UTM zone can extend beyond the LUT, producing out-of-bounds slices.
+    # We clamp to [0, lut.height/width] and pad the result with NaN.
+    row_start_raw, row_stop_raw = row_sl.start, row_sl.stop
+    col_start_raw, col_stop_raw = col_sl.start, col_sl.stop
+
+    row_start = max(row_start_raw, 0)
+    row_stop = min(row_stop_raw, lut.height)
+    col_start = max(col_start_raw, 0)
+    col_stop = min(col_stop_raw, lut.width)
+
+    # If the clamped region is empty the cell is fully outside the LUT
+    if row_start >= row_stop or col_start >= col_stop:
+        tile = np.full((target_h, target_w), np.nan, dtype=np.float32)
+    else:
+        clamped_row_sl = slice(row_start, row_stop)
+        clamped_col_sl = slice(col_start, col_stop)
+        inner_tile = apply_lut(source_crop.values, lut, clamped_row_sl, clamped_col_sl)
+
+        if inner_tile.shape == (target_h, target_w):
+            tile = inner_tile
+        else:
+            # Pad the clamped tile back to the full target size with NaN
+            tile = np.full((target_h, target_w), np.nan, dtype=np.float32)
+            # Offsets into the full tile where the valid data goes
+            pad_top = row_start - row_start_raw
+            pad_left = col_start - col_start_raw
+            tile[
+                pad_top : pad_top + inner_tile.shape[0],
+                pad_left : pad_left + inner_tile.shape[1],
+            ] = inner_tile
 
     # Coordinates (centers of the pixels, descending y)
     x_coords, y_coords = area_def.get_proj_vectors()
@@ -318,6 +366,9 @@ def extract_cell_from_lut(
         dims=("y", "x"),
         name="goes_data",
     )
+
+    cell_w = target_w
+    cell_h = target_h
 
     # Set CRS and transform using rioxarray conventions
     da.rio.write_crs(f"EPSG:{lut.utm_epsg}", inplace=True)

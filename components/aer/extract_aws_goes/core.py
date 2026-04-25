@@ -1,14 +1,13 @@
-import gc
 import hashlib
-import re
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Sequence, cast, override
 
+import attrs
+
 import rioxarray  # noqa: F401
 
 import geopandas as gpd
-import numpy as np
 import pandas as pd
 import s3fs
 from aer.grid import GridCell
@@ -16,10 +15,9 @@ from aer.interfaces import ExtractionTask, Extractor
 from aer.repository import AerLocalSpectralRepository
 from aer.schemas import ArtifactSchema, AssetSchema
 from pandera.typing.geopandas import GeoDataFrame
-from satpy.scene import Scene
 from shapely.geometry.base import BaseGeometry
-from shapely.ops import unary_union
 from structlog import get_logger
+
 
 try:
     from osgeo import gdal, osr
@@ -28,10 +26,12 @@ except ImportError:
     osr = None
 
 from .utils import (
-    detect_reader,
+    create_extraction_artifact,
+    create_metadata_from_row,
     detect_combo,
-    map_channel_ids_to_satpy_names,
+    read_goes_crop,
 )
+
 
 logger = get_logger()
 
@@ -222,10 +222,7 @@ class AwsGoesExtractor(Extractor, plugin_abstract=False):
             GeoDataFrame containing references to extracted artifacts.
         """
         extract_params = extract_params or {}
-        if extract_params.get("engine") == "satpy":
-            return self._extract_satpy(extraction_task, extract_params)
-        else:
-            return self._extract_lut(extraction_task, extract_params)
+        return self._extract_lut(extraction_task, extract_params)
 
     # ── LUT-based extraction ───────────────────────────────
 
@@ -250,188 +247,113 @@ class AwsGoesExtractor(Extractor, plugin_abstract=False):
         Returns:
             GeoDataFrame containing references to extracted artifacts.
         """
-        from aer.extract_aws_goes.lut import get_default_bucket_uri
+        from aer.extract_aws_goes.lut import (
+            extract_cell_from_lut,
+            get_default_bucket_uri,
+            load_utm_zone_lut,
+        )
 
-        lut_dir_str = extract_params.get("lut_dir")
-        if lut_dir_str:
-            bucket_uri = str(Path(lut_dir_str))
-        else:
-            bucket_uri = extract_params.get("bucket_uri", get_default_bucket_uri())
+        from aer.extract_aws_goes.utils import download_lut_if_needed
 
-        assets = extraction_task.assets
-        resolution = extraction_task.resolution
-        uri = extraction_task.uri
-        grid_cells = extraction_task.overlapping_grid_cells
+        lut_dir_str = extract_params.get("lut_dir", "/tmp/luts")
+        local_lut_dir = Path(lut_dir_str)
+        bucket_uri = extract_params.get("bucket_uri", get_default_bucket_uri())
 
-        first_row = assets.iloc[0]
-        href = first_row["href"]
-        granule_id = first_row.get("granule_id", Path(href).name)
-        channel_id = first_row.get("channel_id")
-        collection = first_row["collection"]
-        start_time = first_row["start_time"]
-        end_time = first_row["end_time"]
-        source_ids = ",".join(assets["id"].astype(str).tolist())
+        first_row = extraction_task.assets.iloc[0]
+        meta = create_metadata_from_row(first_row, extract_params, extraction_task)
 
-        if channel_id is None:
-            raise ValueError(f"No channel_id for granule: {granule_id}")
+        # Download from S3 (or copy if local)
+        meta.local_dir.mkdir(parents=True, exist_ok=True)
+        if not meta.local_path.exists():
+            if meta.href.startswith("s3://"):
+                fs = s3fs.S3FileSystem(anon=True)
+                fs.get(meta.href.replace("s3://", ""), str(meta.local_path))
+            elif Path(meta.href).exists():
+                # If it's a local path and different from target local_path, copy it
+                if Path(meta.href).absolute() != meta.local_path.absolute():
+                    import shutil
 
-        # Download from S3
-        local_dir = Path(uri).absolute()
-        local_dir.mkdir(parents=True, exist_ok=True)
-        local_path = local_dir / Path(href).name
-        if not local_path.exists():
-            fs = s3fs.S3FileSystem(anon=True)
-            fs.get(href.replace("s3://", ""), str(local_path))
-        logger.info("file_downloaded", local_path=str(local_path))
+                    shutil.copy(meta.href, meta.local_path)
+            else:
+                raise FileNotFoundError(f"Source file not found at {meta.href}")
 
-        # Determine variable name based on product
-        src_path = self._detect_subdataset(str(local_path), channel_id)
-        var_name = src_path.split(":")[-1] if ":" in src_path else "Rad"
+        logger.info("file_downloaded", local_path=str(meta.local_path))
 
-        # Calibration
-        calibration = extract_params.get("calibration", "counts")
-        cal_params = {}
-        if calibration not in ("radiance", "counts"):
-            cal_params = self._read_abi_calibration_params(src_path)
-
-        dataset_name = f"C{int(channel_id):02d}" if channel_id.isdigit() else channel_id
         artifact_rows: list[dict[str, Any]] = []
 
         # Group grid cells by UTM zone for LUT loading
         from collections import defaultdict
-        from aer.extract_aws_goes.lut import (
-            extract_cell_from_lut,
-            load_utm_zone_lut,
-        )
-        from .utils import (
-            compute_cell_slice,
-            read_goes_crop,
-        )
 
         utm_groups: dict[int, list[GridCell]] = defaultdict(list)
-        for gc_ in grid_cells:
+        for gc_ in extraction_task.overlapping_grid_cells:
             epsg = int(str(gc_.utm_crs).replace("EPSG:", "").replace("epsg:", ""))
             utm_groups[epsg].append(gc_)
 
-        for utm_epsg, group_cells in utm_groups.items():
+        def _extract_utm_group(utm_epsg, group_cells):
             try:
-                # Detect combo (e.g. goes_east_radf) for auto-download
-                combo = self._detect_combo(href)
+                combo = detect_combo(meta.href)
 
-                # Load UTM zone LUT metadata and arrays from .npz
-                # crop_slices are stored in the .npz and loaded into lut
-                lut = load_utm_zone_lut(bucket_uri, utm_epsg, int(resolution), combo=combo)
-                lut_extent = lut.area_extent
-                crop_slices = lut.crop_slices
-
-                if crop_slices is None:
-                    raise ValueError(f"No crop_slices found for EPSG:{utm_epsg} {resolution}m in .npz metadata")
-
-                src_row_sl = slice(crop_slices[0], crop_slices[1])
-                src_col_sl = slice(crop_slices[2], crop_slices[3])
-
-                # Read only the needed crop from the GOES file via h5py
-                apply_scale_offset = calibration != "counts"
-                source_crop = read_goes_crop(
-                    local_path, src_row_sl, src_col_sl, variable=var_name, apply_scale_offset=apply_scale_offset
+                download_lut_if_needed(
+                    combo=combo,
+                    utm_epsg=utm_epsg,
+                    resolution=meta.resolution,
+                    local_dir=local_lut_dir,
+                    remote_bucket=bucket_uri,
                 )
+
+                lut = load_utm_zone_lut(local_lut_dir, utm_epsg, meta.resolution, combo=combo)
+
+                # Read only the needed crop from the GOES file via Satpy (in read_goes_crop)
+                source_crop = read_goes_crop(str(meta.local_path), lut.crop_slices, calibration=meta.calibration)
 
                 logger.info(
                     "source_crop_loaded",
                     utm_epsg=utm_epsg,
                     crop_shape=source_crop.shape,
+                    calibration=meta.calibration,
                 )
 
-                def _extract_one(gc_):
+                group_results = []
+                for gc_ in group_cells:
                     try:
-                        bounds = gc_.utm_footprint.bounds  # (minx, miny, maxx, maxy)
-                        area_def = gc_.area_def(int(resolution))
-                        row_sl, col_sl, eff_extent = compute_cell_slice(
-                            bounds,
-                            lut_extent,
-                            int(resolution),
-                            target_width=area_def.width,
-                            target_height=area_def.height,
-                        )
+                        # Extract cell using the LUT
+                        cell_data = extract_cell_from_lut(source_crop, gc_, lut)
 
-                        cell_data = extract_cell_from_lut(
-                            source_crop,
-                            lut,
-                            row_sl,
-                            col_sl,
-                        )
-
-                        # Apply calibration
-                        if calibration not in ("radiance", "counts") and cal_params:
-                            cell_data = self._apply_abi_calibration(cell_data, calibration, cal_params)
-
-                        # Save as GeoTIFF — use the LUT-grid-aligned extent so
-                        # pixel values and geospatial coordinates are consistent.
-                        area_name = gc_.area_name(int(resolution))
-
-                        combo_parts = AwsGoesExtractor._detect_combo(href).split("_")
+                        # Save as GeoTIFF
+                        area_name = gc_.area_name(meta.resolution)
+                        combo_parts = combo.split("_")
                         eoids_sat = f"{combo_parts[0]}_{combo_parts[1]}" if len(combo_parts) >= 2 else "unknown"
-                        eoids_prod = collection.split("-")[-1]
+                        eoids_prod = meta.collection.split("-")[-1]
 
                         from aer.eoids import build_eoids_path
 
                         output_path = build_eoids_path(
-                            local_dir=local_dir,
+                            local_dir=meta.local_dir,
                             cell_id=gc_.id(),
-                            start_time=start_time,
-                            end_time=end_time,
+                            start_time=meta.start_time,
+                            end_time=meta.end_time,
                             satellite=eoids_sat,
                             product=eoids_prod,
-                            band=dataset_name,
-                            resolution=int(resolution),
+                            band=meta.dataset_name,
+                            resolution=meta.resolution,
                         )
 
                         if not output_path.exists():
-                            import rasterio
-                            from rasterio.crs import CRS as RioCRS
-                            from rasterio.transform import from_bounds
+                            # Use rioxarray to save the DataArray to GeoTIFF
+                            cell_data.rio.to_raster(
+                                str(output_path),
+                                driver="GTiff",
+                                compress="deflate",
+                                predictor=2,
+                                zlevel=1,
+                                tiled=True,
+                                blockxsize=512,
+                                blockysize=512,
+                            )
 
-                            dst_crs = str(gc_.utm_crs)
-                            if dst_crs.isdigit():
-                                dst_crs = f"EPSG:{dst_crs}"
-                            minx, miny, maxx, maxy = eff_extent
-                            cell_w = col_sl.stop - col_sl.start
-                            cell_h = row_sl.stop - row_sl.start
-                            dst_transform = from_bounds(minx, miny, maxx, maxy, cell_w, cell_h)
-
-                            profile = {
-                                "driver": "GTiff",
-                                "dtype": "float32",
-                                "width": cell_w,
-                                "height": cell_h,
-                                "count": 1,
-                                "crs": RioCRS.from_user_input(dst_crs),
-                                "transform": dst_transform,
-                                "compress": "deflate",
-                                "predictor": 2,
-                                "zlevel": 1,
-                                "tiled": True,
-                                "blockxsize": 512,
-                                "blockysize": 512,
-                            }
-                            with rasterio.open(str(output_path), "w", **profile) as dst:
-                                dst.write(cell_data.astype(np.float32), 1)
-
-                        artifact_id = hashlib.md5(f"{granule_id}_{area_name}".encode()).hexdigest()
-                        return {
-                            "id": artifact_id,
-                            "source_ids": source_ids,
-                            "start_time": start_time,
-                            "end_time": end_time,
-                            "uri": str(output_path),
-                            "geometry": gc_.geom,
-                            "collection": collection,
-                            "grid_cell": gc_.id(),
-                            "grid_dist": gc_.D,
-                            "cell_geometry": gc_.geom,
-                            "cell_utm_crs": str(gc_.utm_crs),
-                            "cell_utm_footprint": gc_.utm_footprint,
-                        }
+                        artifact_id = hashlib.md5(f"{meta.granule_id}_{area_name}".encode()).hexdigest()
+                        artifact = create_extraction_artifact(artifact_id, meta, output_path, gc_)
+                        group_results.append(attrs.asdict(artifact))
                     except Exception as exc:
                         logger.error(
                             "cell_extract_failed",
@@ -439,306 +361,66 @@ class AwsGoesExtractor(Extractor, plugin_abstract=False):
                             grid_cell=gc_.id(),
                             engine="lut",
                         )
-                        return None
-
-                max_workers = extract_params.get("max_workers", 16)
-                with ThreadPoolExecutor(max_workers=max_workers) as pool:
-                    futures = [pool.submit(_extract_one, gc_) for gc_ in group_cells]
-                    for fut in as_completed(futures):
-                        res = fut.result()
-                        if res:
-                            artifact_rows.append(res)
-
+                return group_results
             except Exception as grp_exc:
                 logger.error("utm_group_lut_failed", error=str(grp_exc), utm_epsg=utm_epsg)
+                return []
+
+        # Parallelize by UTM zone (usually 1-3 per granule)
+        max_workers = extract_params.get("max_workers", 4)
+        print("Max workers: ", max_workers)
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = [pool.submit(_extract_utm_group, epsg, cells) for epsg, cells in utm_groups.items()]
+            for fut in as_completed(futures):
+                artifact_rows.extend(fut.result())
 
         if not artifact_rows:
-            raise ValueError(f"All grid cells failed for granule: {granule_id}")
+            raise ValueError(f"All grid cells failed for granule: {meta.granule_id}")
 
-        Path(local_path).unlink()
+        if meta.local_path.exists():
+            meta.local_path.unlink()
+
         gdf = gpd.GeoDataFrame(artifact_rows, geometry="geometry")
         return cast(GeoDataFrame[ArtifactSchema], ArtifactSchema.validate(gdf))
 
-    # ── satpy-based extraction (current default) ──────────────────────────
-
-    def _extract_satpy(
-        self,
-        extraction_task: ExtractionTask,
-        extract_params: dict[str, Any],
-    ) -> GeoDataFrame[ArtifactSchema]:
-        """Extract using satpy Scene.resample + rioxarray clip_box.
-
-        Args:
-            extraction_task: The task containing assets and grid cells to extract.
-            extract_params: Dictionary of parameters for Satpy load and resample.
-
-        Returns:
-            GeoDataFrame containing references to extracted artifacts.
-        """
-        assets = extraction_task.assets
-        resolution = extraction_task.resolution
-        uri = extraction_task.uri
-        grid_cells = extraction_task.overlapping_grid_cells
-
-        # This extractor uses one row per granule, so we can take metadata from the 1st row
-        first_row = assets.iloc[0]
-        href: str = first_row["href"]
-        granule_id: str = first_row.get("granule_id", Path(href).name)
-        channel_id: str | None = first_row.get("channel_id")
-        collection: str = first_row["collection"]
-        start_time = first_row["start_time"]
-        end_time = first_row["end_time"]
-        source_ids = ",".join(assets["id"].astype(str).tolist())
-
-        reader = detect_reader(href)
-        if reader is None:
-            raise ValueError(f"Cannot detect satpy reader from granule: {granule_id}")
-
-        if channel_id is None:
-            raise ValueError(f"No channel_id in asset row for granule: {granule_id}")
-
-        # Download file from S3
-        import s3fs
-
-        fs = s3fs.S3FileSystem(anon=True)
-        local_dir = Path(uri)
-        local_dir.mkdir(parents=True, exist_ok=True)
-        local_path = local_dir / Path(href).name
-        if not local_path.exists():
-            s3_path = href.replace("s3://", "")
-            fs.get(s3_path, str(local_path))
-        logger.info("file_downloaded", local_path=str(local_path))
-
-        # Build satpy scene
-        scene = Scene(reader=reader, filenames=[str(local_path)])
-        available = set(scene.available_dataset_names())
-        mapped = map_channel_ids_to_satpy_names({channel_id}, available)
-
-        if not mapped:
-            raise ValueError(f"Channel {channel_id} not found in available datasets: {available}")
-
-        dataset_name = mapped[0]
-        modifiers = extract_params.get("modifiers", "*")
-        calibration = extract_params.get("calibration", "counts")
-        scene.load([dataset_name], modifiers=modifiers, calibration=calibration)
-
-        artifact_rows: list[dict[str, Any]] = []
-
-        # Process grid cells by UTM zone
-        from collections import defaultdict
-
-        utm_groups: dict[str, list[GridCell]] = defaultdict(list)
-        for gc_ in grid_cells:
-            utm_groups[str(gc_.utm_crs)].append(gc_)
-
-        for utm_crs, group_cells in utm_groups.items():
-            try:
-                # 1. Compute bounding box for the entire UTM group
-                all_footprints = [gc_.utm_footprint for gc_ in group_cells]
-                union_geom = unary_union(all_footprints)
-                minx, miny, maxx, maxy = union_geom.bounds
-
-                # 2. Create AreaDefinition for the group
-                # Align extent to resolution to avoid sub-pixel shifts
-                # Add 2 pixels padding to avoid out-of-bounds indexing when extracting exactly like LUT
-                res = float(resolution)
-                minx = np.floor(minx / res) * res - res * 2
-                miny = np.floor(miny / res) * res - res * 2
-                maxx = np.ceil(maxx / res) * res + res * 2
-                maxy = np.ceil(maxy / res) * res + res * 2
-
-                width = int((maxx - minx) / res)
-                height = int((maxy - miny) / res)
-                area_extent = (minx, miny, maxx, maxy)
-                area_id = f"group_{utm_crs}_{granule_id}"
-
-                from pyresample.geometry import AreaDefinition
-
-                group_area_def = AreaDefinition(
-                    area_id,
-                    f"Group area for {utm_crs}",
-                    "area_id",
-                    utm_crs,
-                    width,
-                    height,
-                    area_extent,
-                )
-
-                # 3. Resample scene once for this group
-                logger.info(
-                    "resampling_group",
-                    utm_crs=utm_crs,
-                    num_cells=len(group_cells),
-                    width=width,
-                    height=height,
-                )
-                resampled_scene = scene.resample(
-                    destination=group_area_def,
-                    datasets=[dataset_name],
-                    resampler="nearest",
-                    unload=False,
-                )
-                group_resampled_da = resampled_scene[dataset_name]
-                # Ensure CRS is set for rioxarray
-                group_resampled_da.rio.write_crs(utm_crs, inplace=True)
-
-                # 4. Extract each cell from the group resampled data in parallel
-                # Threads are ideal here as they share the large resampled array and the work is mainly I/O
-                def _extract_cell(gc_: GridCell) -> dict[str, Any] | None:
-                    try:
-                        area_name = gc_.area_name(int(resolution))
-
-                        combo_parts = AwsGoesExtractor._detect_combo(href).split("_")
-                        eoids_sat = f"{combo_parts[0]}_{combo_parts[1]}" if len(combo_parts) >= 2 else "unknown"
-                        eoids_prod = collection.split("-")[-1]
-
-                        from aer.eoids import build_eoids_path
-
-                        output_path = build_eoids_path(
-                            local_dir=local_dir,
-                            cell_id=gc_.id(),
-                            start_time=start_time,
-                            end_time=end_time,
-                            satellite=eoids_sat,
-                            product=eoids_prod,
-                            band=dataset_name,
-                            resolution=int(resolution),
-                        )
-
-                        if output_path.exists():
-                            logger.info("output_exists", path=str(output_path))
-                        else:
-                            import rasterio
-                            from rasterio.transform import from_bounds
-                            from .utils import compute_cell_slice
-
-                            cell_area_def = gc_.area_def(int(resolution))
-                            row_sl, col_sl, eff_extent = compute_cell_slice(
-                                gc_.utm_footprint.bounds,
-                                group_area_def.area_extent,
-                                int(resolution),
-                                target_width=cell_area_def.width,
-                                target_height=cell_area_def.height,
-                            )
-
-                            full_arr = group_resampled_da.values
-                            if len(full_arr.shape) == 3 and full_arr.shape[0] == 1:
-                                full_arr = full_arr[0]
-                            cell_data = full_arr[row_sl, col_sl]
-
-                            dst_crs = str(gc_.utm_crs)
-                            if dst_crs.isdigit():
-                                dst_crs = f"EPSG:{dst_crs}"
-
-                            minx, miny, maxx, maxy = eff_extent
-                            cell_w = col_sl.stop - col_sl.start
-                            cell_h = row_sl.stop - row_sl.start
-                            dst_transform = from_bounds(minx, miny, maxx, maxy, cell_w, cell_h)
-
-                            profile = {
-                                "driver": "GTiff",
-                                "dtype": "float32",
-                                "width": cell_w,
-                                "height": cell_h,
-                                "count": 1,
-                                "crs": rasterio.crs.CRS.from_user_input(dst_crs),
-                                "transform": dst_transform,
-                                "compress": "deflate",
-                                "predictor": 2,
-                                "zlevel": 1,
-                                "tiled": True,
-                                "blockxsize": 512,
-                                "blockysize": 512,
-                            }
-                            with rasterio.open(str(output_path), "w", **profile) as dst:
-                                dst.write(cell_data.astype(np.float32), 1)
-
-                        # Build artifact row
-                        artifact_id = hashlib.md5(f"{granule_id}_{area_name}".encode()).hexdigest()
-                        return {
-                            "id": artifact_id,
-                            "source_ids": source_ids,
-                            "start_time": start_time,
-                            "end_time": end_time,
-                            "uri": str(output_path),
-                            "geometry": gc_.geom,
-                            "collection": collection,
-                            "grid_cell": gc_.id(),
-                            "grid_dist": gc_.D,
-                            "cell_geometry": gc_.geom,
-                            "cell_utm_crs": str(gc_.utm_crs),
-                            "cell_utm_footprint": gc_.utm_footprint,
-                        }
-                    except Exception as cell_exc:
-                        logger.error(
-                            "cell_extract_failed",
-                            error=str(cell_exc),
-                            grid_cell=gc_.id(),
-                        )
-                        return None
-
-                max_cell_workers = extract_params.get("max_workers", 16)
-                with ThreadPoolExecutor(max_workers=max_cell_workers) as cell_pool:
-                    cell_futures = [cell_pool.submit(_extract_cell, gc_) for gc_ in group_cells]
-                    for cf in as_completed(cell_futures):
-                        res = cf.result()
-                        if res:
-                            artifact_rows.append(res)
-
-                del group_resampled_da
-                gc.collect()
-
-            except Exception as grp_exc:
-                logger.error("utm_group_extract_failed", error=str(grp_exc), utm_crs=utm_crs)
-
-        if not artifact_rows:
-            raise ValueError(f"All grid cells failed for granule: {granule_id}")
-
-        # rm downloaded file
-        Path(local_path).unlink()
-
-        gdf = gpd.GeoDataFrame(artifact_rows, geometry="geometry")
-        validated = ArtifactSchema.validate(gdf)
-        return cast(GeoDataFrame[ArtifactSchema], validated)
-
     # ── Helpers ───────────────────────────────
 
-    @override
-    def extract_batches(
-        self,
-        extraction_task_batch: Sequence[ExtractionTask],
-        extract_params: dict[str, Any] | None = None,
-    ) -> GeoDataFrame[ArtifactSchema]:
-        extract_params = extract_params or {}
-        max_batch_workers = extract_params.get("max_batch_workers")
-        if max_batch_workers is None:
-            # run sequential calling super
-            return super().extract_batches(extraction_task_batch, extract_params)
+    # @override
+    # def extract_batches(
+    #     self,
+    #     extraction_task_batch: Sequence[ExtractionTask],
+    #     extract_params: dict[str, Any] | None = None,
+    # ) -> GeoDataFrame[ArtifactSchema]:
+    #     extract_params = extract_params or {}
+    #     max_batch_workers = extract_params.get("max_batch_workers")
+    #     if max_batch_workers is None:
+    #         # run sequential calling super
+    #         return super().extract_batches(extraction_task_batch, extract_params)
 
-        results: list[GeoDataFrame[ArtifactSchema]] = []
-        errors: list[str] = []
+    #     results: list[GeoDataFrame[ArtifactSchema]] = []
+    #     errors: list[str] = []
 
-        # Important: pass explicit args to avoid closure issues
-        tasks = [(self, batch, extract_params) for batch in extraction_task_batch]
+    #     # Important: pass explicit args to avoid closure issues
+    #     tasks = [(self, batch, extract_params) for batch in extraction_task_batch]
 
-        with ProcessPoolExecutor(max_workers=max_batch_workers) as executor:
-            futures = {executor.submit(_extract_wrapper, t): i for i, t in enumerate(tasks)}
+    #     with ProcessPoolExecutor(max_workers=max_batch_workers) as executor:
+    #         futures = {executor.submit(_extract_wrapper, t): i for i, t in enumerate(tasks)}
 
-            for future in as_completed(futures):
-                batch_idx = futures[future]
-                try:
-                    df = future.result()
-                    results.append(df)
-                except Exception as exc:
-                    logger.error("batch_extract_failed", batch=batch_idx, error=str(exc))
-                    errors.append(str(exc))
+    #         for future in as_completed(futures):
+    #             batch_idx = futures[future]
+    #             try:
+    #                 df = future.result()
+    #                 results.append(df)
+    #             except Exception as exc:
+    #                 logger.error("batch_extract_failed", batch=batch_idx, error=str(exc))
+    #                 errors.append(str(exc))
 
-        if not results:
-            raise RuntimeError(f"All {len(extraction_task_batch)} batches failed. Errors: {errors}")
+    #     if not results:
+    #         raise RuntimeError(f"All {len(extraction_task_batch)} batches failed. Errors: {errors}")
 
-        concatenated = pd.concat(results, ignore_index=True)
-        validated = ArtifactSchema.validate(concatenated)
-        return cast(GeoDataFrame[ArtifactSchema], validated)
+    #     concatenated = pd.concat(results, ignore_index=True)
+    #     validated = ArtifactSchema.validate(concatenated)
+    #     return cast(GeoDataFrame[ArtifactSchema], validated)
 
     @staticmethod
     def _detect_combo(href: str) -> str:

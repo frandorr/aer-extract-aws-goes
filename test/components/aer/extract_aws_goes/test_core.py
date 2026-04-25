@@ -1,19 +1,15 @@
 from datetime import datetime, timezone
-from pathlib import Path
-from typing import Sequence
-from unittest.mock import MagicMock, patch
-
 import geopandas as gpd
-import numpy as np
 import pandas as pd
 import pytest
 from aer.extract_aws_goes.core import (
     AwsGoesExtractor,
+)
+from aer.extract_aws_goes.utils import (
     detect_reader,
     map_channel_ids_to_satpy_names,
 )
-from aer.interfaces import Extractor, ExtractionTask
-from aer.schemas import ArtifactSchema, AssetSchema
+from aer.interfaces import Extractor
 from shapely.geometry import box
 
 

@@ -22,6 +22,7 @@ dependencies = [
     "satpy>=0.60.0",
     "xarray>=2026.2.0",
     "blosc2>=4.1.2",
+    "huggingface-hub>=1.12.0",
 ]
 
 
@@ -65,9 +66,12 @@ venvPath = "."
 venv = ".venv"
 extraPaths = ["components/", "bases/"]
 
+[tool.polylith.bricks]
+"components/aer/extract_aws_goes" = "aer/extract_aws_goes"
 [dependency-groups]
 dev = [
     "aer-extract-aws-goes",
+    "hf-transfer>=0.1.9",
     "ipykernel>=7.2.0",
     "jupyter>=1.1.1",
     "line-profiler>=5.0.2",

@@ -4,10 +4,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, cast, Sequence
 
+import cattrs
+from attrs import field, frozen, validators
+
 import numpy as np
 import pyproj
 from pyresample.geometry import AreaDefinition
 from satpy.scene import Scene
+from shapely.geometry.base import BaseGeometry
 import xarray as xr
 
 L1B_PATTERN = re.compile(r"ABI-L1b-Rad[CF]")
@@ -24,6 +28,100 @@ KNOWN_GOES_SHAPES: dict[int, tuple[int, int]] = {
     1500 * 2500: (1500, 2500),  # 1 km
     750 * 1250: (750, 1250),  # 2 km
 }
+
+
+def validate_channel_id(instance, attribute, value):
+    if not value or value == "None":
+        raise ValueError("channel_id is required and cannot be empty")
+
+
+@frozen
+class ExtractionArtifact:
+    id: str = field(validator=validators.instance_of(str))
+    source_ids: str
+    start_time: datetime
+    end_time: datetime
+    uri: str = field(validator=validators.instance_of(str))
+    geometry: BaseGeometry
+    collection: str
+    grid_cell: str
+    grid_dist: float
+    cell_geometry: BaseGeometry
+    cell_utm_crs: str
+    cell_utm_footprint: BaseGeometry
+
+
+@frozen
+class GoesExtractionMetadata:
+    granule_id: str
+    channel_id: str = field(validator=validate_channel_id)
+    collection: str
+    start_time: datetime
+    end_time: datetime
+    source_ids: str
+    href: str
+    resolution: int
+    local_path: Path = field(converter=Path)
+    local_dir: Path = field(converter=Path)
+    calibration: str = field(default="counts")
+
+    @property
+    def dataset_name(self) -> str:
+        """Derive satpy dataset name (e.g. 'C01') from channel_id."""
+        if self.channel_id.isdigit():
+            return f"C{int(self.channel_id):02d}"
+        return self.channel_id
+
+
+# Create a converter instance for handling the structure
+converter = cattrs.Converter()
+converter.register_structure_hook(datetime, lambda v, _: v if isinstance(v, datetime) else datetime.fromisoformat(v))
+converter.register_structure_hook(BaseGeometry, lambda v, _: v)
+
+
+def create_extraction_artifact(
+    artifact_id: str,
+    meta: GoesExtractionMetadata,
+    output_path: Path,
+    gc_: Any,
+) -> ExtractionArtifact:
+    """Helper to create an ExtractionArtifact from metadata and a grid cell."""
+    data = {
+        "id": artifact_id,
+        "source_ids": meta.source_ids,
+        "start_time": meta.start_time,
+        "end_time": meta.end_time,
+        "uri": str(output_path),
+        "geometry": gc_.geom,
+        "collection": meta.collection,
+        "grid_cell": gc_.id(),
+        "grid_dist": float(gc_.D),
+        "cell_geometry": gc_.geom,
+        "cell_utm_crs": str(gc_.utm_crs),
+        "cell_utm_footprint": gc_.utm_footprint,
+    }
+    return converter.structure(data, ExtractionArtifact)
+
+
+def create_metadata_from_row(row: Any, extra_params: dict, extraction_task: Any) -> GoesExtractionMetadata:
+    """Prepare GoesExtractionMetadata from a task asset row and parameters."""
+    data = {
+        "granule_id": row.get("granule_id", Path(row["href"]).name),
+        "channel_id": str(row.get("channel_id")),
+        "collection": row["collection"],
+        "start_time": row["start_time"],
+        "end_time": row["end_time"],
+        "source_ids": ",".join(extraction_task.assets["id"].astype(str).tolist()),
+        "href": row["href"],
+        "resolution": int(extraction_task.resolution),
+        "local_path": Path(extraction_task.uri).absolute() / Path(row["href"]).name,
+        "local_dir": Path(extraction_task.uri).absolute(),
+        "calibration": extra_params.get("calibration", "counts"),
+    }
+
+    return converter.structure(data, GoesExtractionMetadata)
+
+
 
 
 def detect_reader(filename: str) -> str | None:
@@ -394,6 +492,13 @@ def compute_utm_zone_area_extent(utm_epsg: int, resolution: int) -> tuple[float,
         raise ValueError(f"Could not determine area of use for EPSG:{utm_epsg}")
 
     west, south, east, north = area.bounds
+    
+    # Add a 2 degree buffer (~220km) to ensure grid cells that cross UTM
+    # boundaries are fully covered by the LUT without getting NaN padded.
+    west -= 2.0
+    east += 2.0
+    south = max(-90.0, south - 2.0)
+    north = min(90.0, north + 2.0)
     transformer = pyproj.Transformer.from_crs("EPSG:4326", crs, always_xy=True)
 
     lons = np.concatenate(
@@ -420,6 +525,20 @@ def compute_utm_zone_area_extent(utm_epsg: int, resolution: int) -> tuple[float,
 
 
 def detect_goes_utm_zones(source_area_def: Any) -> list[int]:
+    """Detect UTM zones that truly intersect the GOES satellite's visible disk.
+
+    Uses a two-pass approach:
+      1. **Coarse filter** — bounding-box overlap in lon/lat (fast, eliminates
+         most of the 120 UTM zones).
+      2. **Precise validation** — for each surviving candidate, sample a 5×5
+         grid of lon/lat points within the UTM zone and project them into
+         geostationary space.  Only zones where at least one sample point
+         lands inside the ``source_area_def.area_extent`` are kept.
+
+    The second pass is necessary because the geostationary visible disk is
+    circular, not rectangular in lon/lat.  Zones at the limb of the disk
+    pass the coarse bbox test but have zero actual pixel overlap.
+    """
     crswgs84 = pyproj.CRS("EPSG:4326")
 
     if hasattr(source_area_def, "crs") and source_area_def.crs is not None:
@@ -429,13 +548,14 @@ def detect_goes_utm_zones(source_area_def: Any) -> list[int]:
     else:
         raise ValueError("Cannot determine CRS from source_area_def")
 
-    transformer = pyproj.Transformer.from_crs(src_crs, crswgs84, always_xy=True)
+    # ── Pass 1: coarse bounding-box filter in lon/lat ────────────────
+    transformer_to_wgs84 = pyproj.Transformer.from_crs(src_crs, crswgs84, always_xy=True)
 
-    minx, miny, maxx, maxy = source_area_def.area_extent
-    xs = np.linspace(minx, maxx, 100)
-    ys = np.linspace(miny, maxy, 100)
+    goes_minx, goes_miny, goes_maxx, goes_maxy = source_area_def.area_extent
+    xs = np.linspace(goes_minx, goes_maxx, 100)
+    ys = np.linspace(goes_miny, goes_maxy, 100)
     xv, yv = np.meshgrid(xs, ys)
-    lons, lats = transformer.transform(xv.ravel(), yv.ravel())
+    lons, lats = transformer_to_wgs84.transform(xv.ravel(), yv.ravel())
 
     valid = np.isfinite(lons) & np.isfinite(lats)
     valid_lons = lons[valid]
@@ -444,40 +564,52 @@ def detect_goes_utm_zones(source_area_def: Any) -> list[int]:
     if len(valid_lons) == 0:
         return []
 
-    goes_min_lon, goes_max_lon = np.min(valid_lons), np.max(valid_lons)
-    goes_min_lat, goes_max_lat = np.min(valid_lats), np.max(valid_lats)
+    goes_min_lon = float(np.min(valid_lons)) - 1
+    goes_max_lon = float(np.max(valid_lons)) + 1
+    goes_min_lat = float(np.min(valid_lats)) - 1
+    goes_max_lat = float(np.max(valid_lats)) + 1
 
-    goes_min_lon -= 1
-    goes_max_lon += 1
-    goes_min_lat -= 1
-    goes_max_lat += 1
+    candidates: list[tuple[int, float, float, float, float]] = []
 
-    utm_zones = []
-
-    # North
-    for z in range(1, 61):
-        epsg = 32600 + z
-        crs = pyproj.CRS.from_epsg(epsg)
-        area = crs.area_of_use
-        if area:
+    for hemisphere_offset in (32600, 32700):
+        for z in range(1, 61):
+            epsg = hemisphere_offset + z
+            crs = pyproj.CRS.from_epsg(epsg)
+            area = crs.area_of_use
+            if not area:
+                continue
             west, south, east, north = area.bounds
 
-            # Simple bounding box overlap logic
-            # Be careful with 180/-180 wrap, but for geostationary usually ok if simple
-            # Since going to WGS84, handle if GOES extends over antimeridian
-
+            # Simple bounding box overlap
             if goes_min_lon <= east and goes_max_lon >= west and goes_min_lat <= north and goes_max_lat >= south:
-                utm_zones.append(epsg)
+                candidates.append((epsg, west, south, east, north))
 
-    # South
-    for z in range(1, 61):
-        epsg = 32700 + z
-        crs = pyproj.CRS.from_epsg(epsg)
-        area = crs.area_of_use
-        if area:
-            west, south, east, north = area.bounds
-            if goes_min_lon <= east and goes_max_lon >= west and goes_min_lat <= north and goes_max_lat >= south:
-                utm_zones.append(epsg)
+    if not candidates:
+        return []
+
+    # ── Pass 2: validate by reverse-projecting into geostationary ────
+    # For each candidate, sample a 5×5 lon/lat grid within the zone
+    # and project into geostationary coordinates.  If at least one
+    # sample falls within the GOES area extent, the zone is kept.
+    transformer_to_goes = pyproj.Transformer.from_crs(crswgs84, src_crs, always_xy=True)
+
+    utm_zones: list[int] = []
+
+    for epsg, west, south, east, north in candidates:
+        sample_lons = np.linspace(west, east, 5)
+        sample_lats = np.linspace(south, north, 5)
+        slons, slats = np.meshgrid(sample_lons, sample_lats)
+
+        gx, gy = transformer_to_goes.transform(slons.ravel(), slats.ravel())
+
+        hits = (
+            np.isfinite(gx) & np.isfinite(gy)
+            & (gx >= goes_minx) & (gx <= goes_maxx)
+            & (gy >= goes_miny) & (gy <= goes_maxy)
+        )
+
+        if np.any(hits):
+            utm_zones.append(epsg)
 
     return sorted(utm_zones)
 
@@ -505,6 +637,9 @@ def compute_source_crop_slices(
     mask_2d = valid_input_index.reshape(source_shape)
     rows_2d, cols_2d = np.where(mask_2d)
 
+    if len(rows_2d) == 0:
+        raise ValueError("No valid source pixels found — UTM zone does not overlap the GOES source grid")
+
     row_min, row_max = int(rows_2d.min()), int(rows_2d.max())
     col_min, col_max = int(cols_2d.min()), int(cols_2d.max())
 
@@ -516,3 +651,47 @@ def compute_source_crop_slices(
     col_offsets = cols_2d - col_min
 
     return row_slice, col_slice, row_offsets, col_offsets
+
+
+def download_lut_if_needed(
+    combo: str,
+    utm_epsg: int,
+    resolution: int,
+    local_dir: str | Path,
+    remote_bucket: str = "hf://datasets/frandorr/aer-data/luts"
+) -> Path:
+    """Download a UTMZoneLUT file from a remote bucket to a local directory if it does not exist locally.
+    
+    Args:
+        combo: Satellite and domain combination (e.g., 'goes_east_f').
+        utm_epsg: UTM EPSG code.
+        resolution: Spatial resolution in meters.
+        local_dir: Local directory to store LUTs.
+        remote_bucket: Remote bucket URI.
+        
+    Returns:
+        Path to the local LUT file.
+    """
+    import fsspec
+    from structlog import get_logger
+    logger = get_logger()
+    
+    local_dir = Path(local_dir)
+    rel_path = f"{combo}/{utm_epsg}/{resolution}m.npz"
+    local_path = local_dir / rel_path
+    
+    if not local_path.exists():
+        remote_path = f"{remote_bucket.rstrip('/')}/{rel_path}"
+        local_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            fs, rpath = fsspec.core.url_to_fs(remote_path)
+            if fs.exists(rpath):
+                logger.info("downloading_lut", remote_path=remote_path, local_path=str(local_path))
+                fs.get(rpath, str(local_path))
+            else:
+                logger.warning("remote_lut_not_found", remote_path=remote_path)
+        except Exception as e:
+            logger.error("lut_download_failed", remote_path=remote_path, error=str(e))
+            
+    return local_path
+
