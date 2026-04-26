@@ -330,3 +330,66 @@ def test_compute_goes_source_area_def():
 
     with pytest.raises(ValueError):
         compute_goes_source_area_def(goes_file="invalid.nc")
+
+
+def test_load_lut_missing_file(tmp_path):
+    """load_lut raises FileNotFoundError when the .npz file does not exist."""
+    from aer.extract_aws_goes.lut import load_lut
+
+    with pytest.raises(FileNotFoundError, match="does not exist"):
+        load_lut(tmp_path / "nonexistent.npz")
+
+
+def test_load_lut_empty_file(tmp_path):
+    """load_lut raises FileNotFoundError (not EOFError) when the .npz file is 0 bytes."""
+    from aer.extract_aws_goes.lut import load_lut
+
+    empty_file = tmp_path / "empty.npz"
+    empty_file.touch()
+    assert empty_file.stat().st_size == 0
+
+    with pytest.raises(FileNotFoundError, match="empty"):
+        load_lut(empty_file)
+
+
+def test_download_lut_if_needed_remote_missing(tmp_path):
+    """download_lut_if_needed raises FileNotFoundError when remote LUT doesn't exist."""
+    from aer.extract_aws_goes.utils import download_lut_if_needed
+
+    # Use a local file:// path as a "remote" that won't have the file
+    fake_remote = str(tmp_path / "fake_remote")
+
+    with pytest.raises(FileNotFoundError, match="LUT not available"):
+        download_lut_if_needed(
+            combo="goes_east_f",
+            utm_epsg=32616,
+            resolution=1000,
+            local_dir=tmp_path / "local",
+            remote_bucket=fake_remote,
+        )
+
+
+def test_download_lut_if_needed_cleans_empty_file(tmp_path):
+    """download_lut_if_needed removes stale 0-byte files and re-attempts download."""
+    from aer.extract_aws_goes.utils import download_lut_if_needed
+
+    local_dir = tmp_path / "local"
+    # Create the 0-byte file that a previous failed download left
+    stale_path = local_dir / "goes_east_f" / "32616" / "1000m.npz"
+    stale_path.parent.mkdir(parents=True, exist_ok=True)
+    stale_path.touch()
+    assert stale_path.exists() and stale_path.stat().st_size == 0
+
+    # Should remove the 0-byte file and fail because remote doesn't have it
+    fake_remote = str(tmp_path / "fake_remote")
+    with pytest.raises(FileNotFoundError):
+        download_lut_if_needed(
+            combo="goes_east_f",
+            utm_epsg=32616,
+            resolution=1000,
+            local_dir=local_dir,
+            remote_bucket=fake_remote,
+        )
+
+    # The stale file should have been removed
+    assert not stale_path.exists()

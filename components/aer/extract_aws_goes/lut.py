@@ -214,6 +214,11 @@ def load_lut(path: str | Path) -> UTMZoneLUT:
     # It will raise an error if the path doesn't exist.
     # Note: fsspec paths might not support mmap_mode directly,
     # but since we are focusing on local data for speed, this is optimized for local.
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(f"LUT file does not exist: {path}")
+    if p.stat().st_size == 0:
+        raise FileNotFoundError(f"LUT file is empty (0 bytes), likely a failed download: {path}")
     with np.load(str(path), mmap_mode="r") as data:
         # Extract metadata and arrays
         # Scalars are returned as 0-d arrays, so we use .item() or [()]

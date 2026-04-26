@@ -658,28 +658,37 @@ def download_lut_if_needed(
     utm_epsg: int,
     resolution: int,
     local_dir: str | Path,
-    remote_bucket: str = "hf://datasets/frandorr/aer-data/luts"
+    remote_bucket: str = "hf://buckets/frandorr/aer-data/luts"
 ) -> Path:
     """Download a UTMZoneLUT file from a remote bucket to a local directory if it does not exist locally.
-    
+
     Args:
         combo: Satellite and domain combination (e.g., 'goes_east_f').
         utm_epsg: UTM EPSG code.
         resolution: Spatial resolution in meters.
         local_dir: Local directory to store LUTs.
         remote_bucket: Remote bucket URI.
-        
+
     Returns:
         Path to the local LUT file.
+
+    Raises:
+        FileNotFoundError: If the LUT is not available locally and cannot be
+            downloaded (remote file missing or download failure).
     """
     import fsspec
     from structlog import get_logger
     logger = get_logger()
-    
+
     local_dir = Path(local_dir)
     rel_path = f"{combo}/{utm_epsg}/{resolution}m.npz"
     local_path = local_dir / rel_path
-    
+
+    # Guard against 0-byte files left by previous failed downloads
+    if local_path.exists() and local_path.stat().st_size == 0:
+        logger.warning("removing_empty_lut", path=str(local_path))
+        local_path.unlink()
+
     if not local_path.exists():
         remote_path = f"{remote_bucket.rstrip('/')}/{rel_path}"
         local_path.parent.mkdir(parents=True, exist_ok=True)
@@ -689,9 +698,25 @@ def download_lut_if_needed(
                 logger.info("downloading_lut", remote_path=remote_path, local_path=str(local_path))
                 fs.get(rpath, str(local_path))
             else:
-                logger.warning("remote_lut_not_found", remote_path=remote_path)
+                raise FileNotFoundError(
+                    f"LUT not available at remote path: {remote_path}"
+                )
+        except FileNotFoundError:
+            raise
         except Exception as e:
-            logger.error("lut_download_failed", remote_path=remote_path, error=str(e))
-            
+            # Clean up any partial download
+            if local_path.exists():
+                local_path.unlink()
+            raise FileNotFoundError(
+                f"Failed to download LUT from {remote_path}: {e}"
+            ) from e
+
+        # Validate the downloaded file is not empty
+        if local_path.exists() and local_path.stat().st_size == 0:
+            local_path.unlink()
+            raise FileNotFoundError(
+                f"Downloaded LUT file is empty (0 bytes): {local_path}"
+            )
+
     return local_path
 

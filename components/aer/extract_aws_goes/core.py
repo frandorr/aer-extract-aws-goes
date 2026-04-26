@@ -292,7 +292,53 @@ class AwsGoesExtractor(Extractor, plugin_abstract=False):
         def _extract_utm_group(utm_epsg, group_cells):
             try:
                 combo = detect_combo(meta.href)
+                combo_parts = combo.split("_")
+                eoids_sat = f"{combo_parts[0]}_{combo_parts[1]}" if len(combo_parts) >= 2 else "unknown"
+                eoids_prod = meta.collection.split("-")[-1]
 
+                from aer.eoids import build_eoids_path
+
+                # ── Pre-compute output paths and separate cached / pending cells ──
+                pending_cells: list[GridCell] = []
+                group_results: list[dict[str, Any]] = []
+
+                for gc_ in group_cells:
+                    output_path = build_eoids_path(
+                        local_dir=meta.local_dir,
+                        cell_id=gc_.id(),
+                        start_time=meta.start_time,
+                        end_time=meta.end_time,
+                        satellite=eoids_sat,
+                        product=eoids_prod,
+                        band=meta.dataset_name,
+                        resolution=meta.resolution,
+                    )
+
+                    if output_path.exists():
+                        # Already extracted — build artifact row without any heavy I/O
+                        area_name = gc_.area_name(meta.resolution)
+                        artifact_id = hashlib.md5(f"{meta.granule_id}_{area_name}".encode()).hexdigest()
+                        artifact = create_extraction_artifact(artifact_id, meta, output_path, gc_)
+                        group_results.append(attrs.asdict(artifact))
+                    else:
+                        pending_cells.append(gc_)
+
+                if not pending_cells:
+                    logger.info(
+                        "utm_group_cached",
+                        utm_epsg=utm_epsg,
+                        cached_cells=len(group_cells),
+                    )
+                    return group_results
+
+                logger.info(
+                    "utm_group_partial_cache",
+                    utm_epsg=utm_epsg,
+                    cached=len(group_cells) - len(pending_cells),
+                    pending=len(pending_cells),
+                )
+
+                # ── Heavy I/O: only runs when there are pending cells ──
                 download_lut_if_needed(
                     combo=combo,
                     utm_epsg=utm_epsg,
@@ -313,19 +359,13 @@ class AwsGoesExtractor(Extractor, plugin_abstract=False):
                     calibration=meta.calibration,
                 )
 
-                group_results = []
-                for gc_ in group_cells:
+                for gc_ in pending_cells:
                     try:
                         # Extract cell using the LUT
                         cell_data = extract_cell_from_lut(source_crop, gc_, lut)
 
                         # Save as GeoTIFF
                         area_name = gc_.area_name(meta.resolution)
-                        combo_parts = combo.split("_")
-                        eoids_sat = f"{combo_parts[0]}_{combo_parts[1]}" if len(combo_parts) >= 2 else "unknown"
-                        eoids_prod = meta.collection.split("-")[-1]
-
-                        from aer.eoids import build_eoids_path
 
                         output_path = build_eoids_path(
                             local_dir=meta.local_dir,
@@ -338,18 +378,17 @@ class AwsGoesExtractor(Extractor, plugin_abstract=False):
                             resolution=meta.resolution,
                         )
 
-                        if not output_path.exists():
-                            # Use rioxarray to save the DataArray to GeoTIFF
-                            cell_data.rio.to_raster(
-                                str(output_path),
-                                driver="GTiff",
-                                compress="deflate",
-                                predictor=2,
-                                zlevel=1,
-                                tiled=True,
-                                blockxsize=512,
-                                blockysize=512,
-                            )
+                        # Use rioxarray to save the DataArray to GeoTIFF
+                        cell_data.rio.to_raster(
+                            str(output_path),
+                            driver="GTiff",
+                            compress="deflate",
+                            predictor=2,
+                            zlevel=1,
+                            tiled=True,
+                            blockxsize=512,
+                            blockysize=512,
+                        )
 
                         artifact_id = hashlib.md5(f"{meta.granule_id}_{area_name}".encode()).hexdigest()
                         artifact = create_extraction_artifact(artifact_id, meta, output_path, gc_)
@@ -362,6 +401,13 @@ class AwsGoesExtractor(Extractor, plugin_abstract=False):
                             engine="lut",
                         )
                 return group_results
+            except FileNotFoundError as fnf:
+                logger.warning(
+                    "utm_group_lut_unavailable",
+                    reason=str(fnf),
+                    utm_epsg=utm_epsg,
+                )
+                return []
             except Exception as grp_exc:
                 logger.error("utm_group_lut_failed", error=str(grp_exc), utm_epsg=utm_epsg)
                 return []
