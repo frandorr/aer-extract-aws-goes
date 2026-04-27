@@ -1,8 +1,10 @@
 import hashlib
+import warnings
 from collections import defaultdict
+from typing import Any, Sequence, cast, override
 from concurrent.futures import ProcessPoolExecutor, as_completed  # noqa: F401
 from pathlib import Path
-from typing import Any, Sequence, cast, override
+
 
 import attrs
 
@@ -10,7 +12,7 @@ import rioxarray  # noqa: F401
 
 import geopandas as gpd
 import pandas as pd
-import s3fs
+
 from aer.interfaces import ExtractionTask, Extractor
 from aer.repository import AerLocalSpectralRepository
 from aer.schemas import ArtifactSchema, AssetSchema
@@ -154,9 +156,20 @@ class AwsGoesExtractor(Extractor, plugin_abstract=False):
         uri: str | None = None,
         prepare_params: dict[str, Any] | None = None,
     ) -> Sequence[ExtractionTask]:
-        """Override the default implementation to set resolution based on GOES product.
+        """Prepare extraction tasks by chunking grid cells into fixed-size batches.
 
-        We'll take resolutions from Instruments Repository provided bt aer-core.
+        Resolution is inferred from the GOES product via the Instruments
+        Repository provided by aer-core.
+
+        All overlapping grid cells for the AOI are computed once, then sliced
+        into fixed-size batches of ``cells_per_chunk`` (default 10).  Each
+        batch becomes an independent ``ExtractionTask`` so that downstream
+        engines can process them concurrently without file-lock contention.
+
+        The computed cells are stored in ``task_context["grid_cells"]`` so
+        engines can consume them directly and avoid re-deriving them from the
+        AOI geometry (which can produce extra cells due to bounding-box
+        expansion of unary-union geometries).
 
         Args:
             search_results: GeoDataFrame containing the search results.
@@ -164,6 +177,8 @@ class AwsGoesExtractor(Extractor, plugin_abstract=False):
             resolution: Fixed resolution to use if not derived from assets.
             uri: Target URI for extraction artifacts.
             prepare_params: Optional parameters for task preparation.
+                Supports ``cells_per_chunk`` (int, default 10) — the number
+                of grid cells per task.
 
         Returns:
             Sequence of ExtractionTask objects.
@@ -175,32 +190,65 @@ class AwsGoesExtractor(Extractor, plugin_abstract=False):
             )
         df = self._add_resolution(search_results, resolution, prepare_params)
 
-        # Group by granule_id
-        # If granule_id is missing, use filename from href
+        # Group by granule_id; if missing, derive from filename
         if "granule_id" not in df.columns:
             df["granule_id"] = df["href"].apply(lambda x: Path(x).name)
 
-        tasks = []
+        prepare_params = prepare_params or {}
+        cells_per_chunk: int = int(prepare_params.get("cells_per_chunk", 50))
+
+        tasks: list[ExtractionTask] = []
         for granule_id, group in df.groupby("granule_id"):
-            # For GOES, all assets in a granule usually have the same resolution
-            # (unless it's a multi-resolution product, but we use the fixed resolution from ExtractionTask)
-            # Actually, ExtractionTask needs a single resolution.
-            # We'll take the resolution from the first asset in the group.
             group_res = group["resolution"].iloc[0]
 
-            task = ExtractionTask(
+            # Determine the AOI geometry
+            if target_aoi is not None:
+                aoi_geom = target_aoi
+            elif hasattr(group, "union_all"):
+                aoi_geom = group.union_all()
+            else:
+                aoi_geom = group.geometry.unary_union
+
+            if aoi_geom is None or aoi_geom.is_empty:
+                continue
+
+            # Compute all overlapping grid cells once for the whole AOI
+            full_task = ExtractionTask(
                 assets=group,
                 target_grid_d=self.target_grid_d,
                 target_grid_overlap=self.target_grid_overlap,
                 resolution=group_res,
                 uri=uri,
-                aoi=target_aoi,
-                task_context={
-                    "prepare_params": prepare_params,
-                    "granule_id": str(granule_id),
-                },
+                aoi=aoi_geom,
             )
-            tasks.append(task)
+            all_cells = list(full_task.overlapping_grid_cells)
+            if not all_cells:
+                continue
+
+            # Slice cells into fixed-size chunks — no spatial logic needed
+            cell_chunks = [all_cells[i : i + cells_per_chunk] for i in range(0, len(all_cells), cells_per_chunk)]
+            total_chunks = len(cell_chunks)
+
+            for chunk_idx, cells in enumerate(cell_chunks):
+                task = ExtractionTask(
+                    assets=group,
+                    target_grid_d=self.target_grid_d,
+                    target_grid_overlap=self.target_grid_overlap,
+                    resolution=group_res,
+                    uri=uri,
+                    aoi=aoi_geom,
+                    task_context={
+                        "prepare_params": prepare_params,
+                        "granule_id": str(granule_id),
+                        "chunk_id": chunk_idx,
+                        "total_chunks": total_chunks,
+                        # Store cells directly — engines use this to avoid
+                        # re-deriving from the AOI geometry.
+                        "grid_cells": cells,
+                    },
+                )
+                tasks.append(task)
+
         return tasks
 
     def extract(
@@ -278,20 +326,7 @@ class AwsGoesExtractor(Extractor, plugin_abstract=False):
         meta = create_metadata_from_row(first_row, extract_params, extraction_task)
 
         # Download from S3 (or copy if local)
-        meta.local_dir.mkdir(parents=True, exist_ok=True)
-        if not meta.local_path.exists():
-            if meta.href.startswith("s3://"):
-                fs = s3fs.S3FileSystem(anon=True)
-                fs.get(meta.href.replace("s3://", ""), str(meta.local_path))
-            elif Path(meta.href).exists():
-                if Path(meta.href).absolute() != meta.local_path.absolute():
-                    import shutil
-
-                    shutil.copy(meta.href, meta.local_path)
-            else:
-                raise FileNotFoundError(f"Source file not found at {meta.href}")
-
-        logger.info("file_downloaded", local_path=str(meta.local_path))
+        self._download_asset_safely(meta)
 
         nc_path = str(meta.local_path)
         reader = detect_reader(nc_path)
@@ -308,17 +343,31 @@ class AwsGoesExtractor(Extractor, plugin_abstract=False):
 
         scn.load([channel_name], calibration=meta.calibration)
         ds = scn[channel_name]
-        ds = ds.odc.assign_crs(ds.crs.item())
+        # Suppress the benign odc-geo warning about goes_imager_projection not being
+        # a recognised grid_mapping coordinate — we assign the CRS manually below.
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message="grid_mapping=goes_imager_projection is not pointing to valid coordinate",
+                category=UserWarning,
+            )
+            ds = ds.odc.assign_crs(ds.crs.item())
 
-        grid_cells = extraction_task.overlapping_grid_cells
+        grid_cells = self._get_grid_cells(extraction_task)
 
         # ── Build ONE global crop covering all cells ───────────────────────────
-        total = box(*unary_union([g.geom for g in grid_cells]).bounds)
+        total = box(*unary_union([g.geom for g in grid_cells]).buffer(0.5).bounds)
         bbox = BoundingBox(*total.bounds[:4], crs="EPSG:4326")
         target_geobox = GeoBox.from_bbox(bbox, resolution=0.014)
         target_poly_src = target_geobox.extent.to_crs(ds.odc.geobox.crs)
         safe_bbox = bbox_intersection([target_poly_src.boundingbox, ds.odc.geobox.extent.boundingbox])
-        crop_ds = ds.odc.crop(safe_bbox.polygon).odc.assign_crs(ds.crs.item()).compute()
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message="grid_mapping=goes_imager_projection is not pointing to valid coordinate",
+                category=UserWarning,
+            )
+            crop_ds = ds.odc.crop(safe_bbox.polygon).odc.assign_crs(ds.crs.item()).compute()
 
         combo = self._detect_combo(meta.href)
         combo_parts = combo.split("_")
@@ -401,8 +450,7 @@ class AwsGoesExtractor(Extractor, plugin_abstract=False):
         if not artifact_rows:
             raise ValueError(f"All grid cells failed for granule: {meta.granule_id}")
 
-        if meta.local_path.exists():
-            meta.local_path.unlink()
+        self._cleanup_asset_safely(meta, extraction_task)
 
         gdf = gpd.GeoDataFrame(artifact_rows, geometry="geometry")
         return cast(GeoDataFrame[ArtifactSchema], ArtifactSchema.validate(gdf))
@@ -435,26 +483,12 @@ class AwsGoesExtractor(Extractor, plugin_abstract=False):
         from shapely.geometry import box
         from satpy.scene import Scene
         from aer.eoids import build_eoids_path
-        from tqdm import tqdm
 
         first_row = extraction_task.assets.iloc[0]
         meta = create_metadata_from_row(first_row, extract_params, extraction_task)
 
         # Download from S3 (or copy if local)
-        meta.local_dir.mkdir(parents=True, exist_ok=True)
-        if not meta.local_path.exists():
-            if meta.href.startswith("s3://"):
-                fs = s3fs.S3FileSystem(anon=True)
-                fs.get(meta.href.replace("s3://", ""), str(meta.local_path))
-            elif Path(meta.href).exists():
-                if Path(meta.href).absolute() != meta.local_path.absolute():
-                    import shutil
-
-                    shutil.copy(meta.href, meta.local_path)
-            else:
-                raise FileNotFoundError(f"Source file not found at {meta.href}")
-
-        logger.info("file_downloaded", local_path=str(meta.local_path), engine="odc_naive")
+        self._download_asset_safely(meta)
 
         nc_path = str(meta.local_path)
         reader = detect_reader(nc_path)
@@ -470,17 +504,31 @@ class AwsGoesExtractor(Extractor, plugin_abstract=False):
         channel_name = channel_names[0]
         scn.load([channel_name], calibration=meta.calibration)
         ds = scn[channel_name]
-        ds = ds.odc.assign_crs(ds.crs.item())
+        # Suppress the benign odc-geo warning about goes_imager_projection not being
+        # a recognised grid_mapping coordinate — we assign the CRS manually below.
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message="grid_mapping=goes_imager_projection is not pointing to valid coordinate",
+                category=UserWarning,
+            )
+            ds = ds.odc.assign_crs(ds.crs.item())
 
-        grid_cells = extraction_task.overlapping_grid_cells
+        grid_cells = self._get_grid_cells(extraction_task)
 
         # Build ONE global crop covering all cells
-        total = box(*unary_union([g.geom for g in grid_cells]).bounds)
+        total = box(*unary_union([g.geom for g in grid_cells]).buffer(0.5).bounds)
         bbox = BoundingBox(*total.bounds[:4], crs="EPSG:4326")
         target_geobox = GeoBox.from_bbox(bbox, resolution=0.014)
         target_poly_src = target_geobox.extent.to_crs(ds.odc.geobox.crs)
         safe_bbox = bbox_intersection([target_poly_src.boundingbox, ds.odc.geobox.extent.boundingbox])
-        crop_ds = ds.odc.crop(safe_bbox.polygon).odc.assign_crs(ds.crs.item()).compute()
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message="grid_mapping=goes_imager_projection is not pointing to valid coordinate",
+                category=UserWarning,
+            )
+            crop_ds = ds.odc.crop(safe_bbox.polygon).odc.assign_crs(ds.crs.item()).compute()
         combo = self._detect_combo(meta.href)
         combo_parts = combo.split("_")
         eoids_sat = f"{combo_parts[0]}_{combo_parts[1]}" if len(combo_parts) >= 2 else "unknown"
@@ -491,7 +539,7 @@ class AwsGoesExtractor(Extractor, plugin_abstract=False):
         padding: int = int(extract_params.get("padding", 0))
         resampling: str = extract_params.get("resampling", "nearest")
 
-        for gc_ in tqdm(grid_cells):
+        for gc_ in grid_cells:
             area_def_obj = gc_.area_def(meta.resolution, padding=padding)
             utm_crs = gc_.utm_crs
             res = meta.resolution
@@ -536,8 +584,7 @@ class AwsGoesExtractor(Extractor, plugin_abstract=False):
         if not artifact_rows:
             raise ValueError(f"All grid cells failed for granule: {meta.granule_id}")
 
-        if meta.local_path.exists():
-            meta.local_path.unlink()
+        self._cleanup_asset_safely(meta, extraction_task)
 
         gdf = gpd.GeoDataFrame(artifact_rows, geometry="geometry")
         return cast(GeoDataFrame[ArtifactSchema], ArtifactSchema.validate(gdf))
@@ -574,20 +621,9 @@ class AwsGoesExtractor(Extractor, plugin_abstract=False):
         meta = create_metadata_from_row(first_row, extract_params, extraction_task)
 
         # Download from S3 (or copy if local)
-        meta.local_dir.mkdir(parents=True, exist_ok=True)
-        if not meta.local_path.exists():
-            if meta.href.startswith("s3://"):
-                fs = s3fs.S3FileSystem(anon=True)
-                fs.get(meta.href.replace("s3://", ""), str(meta.local_path))
-            elif Path(meta.href).exists():
-                if Path(meta.href).absolute() != meta.local_path.absolute():
-                    import shutil
+        self._download_asset_safely(meta)
 
-                    shutil.copy(meta.href, meta.local_path)
-            else:
-                raise FileNotFoundError(f"Source file not found at {meta.href}")
-
-        logger.info("file_downloaded", local_path=str(meta.local_path), engine="pyresample")
+        logger.debug("file_downloaded", local_path=str(meta.local_path), engine="pyresample")
 
         nc_path = str(meta.local_path)
         reader = detect_reader(nc_path)
@@ -603,7 +639,7 @@ class AwsGoesExtractor(Extractor, plugin_abstract=False):
         channel_name = channel_names[0]
         scn.load([channel_name], calibration=meta.calibration)
 
-        grid_cells = extraction_task.overlapping_grid_cells
+        grid_cells = self._get_grid_cells(extraction_task)
 
         combo = self._detect_combo(meta.href)
         combo_parts = combo.split("_")
@@ -617,15 +653,28 @@ class AwsGoesExtractor(Extractor, plugin_abstract=False):
 
         for gc_ in grid_cells:
             area_def_obj = gc_.area_def(meta.resolution, padding=padding)
-            area_yaml = area_def_obj.to_yaml()
-            target_area = load_area_from_string(area_yaml, area_def_obj.area_id)
 
-            rsampled_scn = scn.resample(
-                target_area,
-                unload=False,
-                generate=False,
-                resampler=resampling,
-            )
+            # Suppress the benign "you will likely lose important projection
+            # information when converting to a PROJ string" warning that
+            # pyproj emits whenever pyresample internally calls to_proj4().
+            # Our UTM AreaDefinitions are well-defined and don't actually lose
+            # meaningful precision in this conversion.
+            with warnings.catch_warnings():
+                warnings.filterwarnings(
+                    "ignore",
+                    message="You will likely lose important projection information",
+                    category=UserWarning,
+                    module="pyproj",
+                )
+                area_yaml = area_def_obj.to_yaml()
+                target_area = load_area_from_string(area_yaml, area_def_obj.area_id)
+
+                rsampled_scn = scn.resample(
+                    target_area,
+                    unload=False,
+                    generate=False,
+                    resampler=resampling,
+                )
             cell_da = rsampled_scn[channel_name].compute()
 
             output_path = build_eoids_path(
@@ -663,8 +712,7 @@ class AwsGoesExtractor(Extractor, plugin_abstract=False):
         if not artifact_rows:
             raise ValueError(f"All grid cells failed for granule: {meta.granule_id}")
 
-        if meta.local_path.exists():
-            meta.local_path.unlink()
+        self._cleanup_asset_safely(meta, extraction_task)
 
         gdf = gpd.GeoDataFrame(artifact_rows, geometry="geometry")
         return cast(GeoDataFrame[ArtifactSchema], ArtifactSchema.validate(gdf))
@@ -719,7 +767,79 @@ class AwsGoesExtractor(Extractor, plugin_abstract=False):
         validated = ArtifactSchema.validate(concatenated)
         return cast(GeoDataFrame[ArtifactSchema], validated)
 
+    def _download_asset_safely(self, meta: Any) -> None:
+        """Download asset with a filelock to avoid corruption in multi-processing."""
+        import filelock
+        import s3fs
+        import shutil
+
+        meta.local_dir.mkdir(parents=True, exist_ok=True)
+        lock_path = meta.local_path.with_suffix(".lock")
+
+        with filelock.FileLock(str(lock_path)):
+            if not meta.local_path.exists():
+                if meta.href.startswith("s3://"):
+                    fs = s3fs.S3FileSystem(anon=True)
+                    fs.get(meta.href.replace("s3://", ""), str(meta.local_path))
+                elif Path(meta.href).exists():
+                    if Path(meta.href).absolute() != meta.local_path.absolute():
+                        shutil.copy(meta.href, meta.local_path)
+                else:
+                    raise FileNotFoundError(f"Source file not found at {meta.href}")
+
+    def _cleanup_asset_safely(self, meta: Any, extraction_task: ExtractionTask) -> None:
+        """Safely clean up the downloaded asset after all chunks are processed."""
+        import filelock
+
+        chunk_id = extraction_task.task_context.get("chunk_id")
+        total_chunks = extraction_task.task_context.get("total_chunks", 1)
+
+        lock_path = meta.local_path.with_suffix(".lock")
+        if total_chunks > 1 and chunk_id is not None:
+            done_file = meta.local_path.with_suffix(f".chunk_{chunk_id}.done")
+            done_file.touch()
+            with filelock.FileLock(str(lock_path)):
+                done_files = list(meta.local_path.parent.glob(f"{meta.local_path.stem}.chunk_*.done"))
+                if len(done_files) >= total_chunks:
+                    if meta.local_path.exists():
+                        try:
+                            meta.local_path.unlink()
+                        except Exception:
+                            pass
+                    for df in done_files:
+                        try:
+                            df.unlink()
+                        except Exception:
+                            pass
+                    try:
+                        lock_path.unlink()
+                    except Exception:
+                        pass
+        else:
+            if meta.local_path.exists():
+                try:
+                    meta.local_path.unlink()
+                except Exception:
+                    pass
+
     @staticmethod
     def _detect_combo(href: str) -> str:
         """Helper to detect combo from href using utils."""
         return detect_combo(href)
+
+    @staticmethod
+    def _get_grid_cells(extraction_task: ExtractionTask) -> Sequence[Any]:
+        """Return the grid cells for a task.
+
+        Prefer ``task_context["grid_cells"]`` (set by :meth:`prepare_for_extraction`)
+        so that engines use the exact, pre-computed subset of cells rather than
+        re-deriving them from the AOI geometry (which can produce duplicate cells
+        when the union of cell geometries expands the effective bounding box).
+
+        Falls back to :attr:`ExtractionTask.overlapping_grid_cells` for tasks
+        created outside the normal preparation flow.
+        """
+        cells = extraction_task.task_context.get("grid_cells")
+        if cells is not None:
+            return cells
+        return extraction_task.overlapping_grid_cells

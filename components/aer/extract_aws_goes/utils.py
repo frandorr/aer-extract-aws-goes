@@ -423,4 +423,37 @@ def read_goes_crop(nc_path: str, crop: tuple[int, int, int, int], calibration="c
     return scn[r0:r1, c0:c1][channel_name].compute()
 
 
+def split_aoi_into_chunks(
+    aoi: BaseGeometry,
+    chunk_size: float,
+) -> list[BaseGeometry]:
+    """Split a large AOI into smaller, contiguous square sub-areas.
+
+    Generates a regular grid of ``chunk_size × chunk_size`` cells (in the
+    units of the AOI's CRS — typically degrees for EPSG:4326) that covers
+    the bounding box of *aoi*, then keeps only those cells that actually
+    intersect the AOI.
+
+    Args:
+        aoi: The Area of Interest geometry (e.g. a Shapely Polygon/MultiPolygon).
+        chunk_size: Width and height of each chunk in CRS units.
+
+    Returns:
+        A list of Shapely geometries (boxes) that tile the AOI.
+    """
+    from shapely.geometry import box as shapely_box
+
+    minx, miny, maxx, maxy = aoi.bounds
+
+    x_coords = np.arange(minx, maxx, chunk_size)
+    y_coords = np.arange(miny, maxy, chunk_size)
+
+    chunks: list[BaseGeometry] = []
+    for x in x_coords:
+        for y in y_coords:
+            cell = shapely_box(x, y, x + chunk_size, y + chunk_size)
+            if cell.intersects(aoi):
+                chunks.append(cell)
+
+    return chunks
 

@@ -116,10 +116,17 @@ def test_prepare_groups_by_granule() -> None:
 
     tasks = extractor.prepare_for_extraction(gdf, resolution=2000.0, uri="/tmp/test_output")
 
-    assert len(tasks) == 2  # Two granules
+    assert len(tasks) > 0
     # Check task_context has granule_id
     granule_ids = {t.task_context["granule_id"] for t in tasks}
     assert granule_ids == {"granule_A.nc", "granule_B.nc"}
+
+    # Every task must carry chunk tracking metadata and pre-computed cells
+    for t in tasks:
+        assert "chunk_id" in t.task_context
+        assert "total_chunks" in t.task_context
+        assert "grid_cells" in t.task_context
+        assert len(t.task_context["grid_cells"]) > 0
 
 
 def test_prepare_requires_resolution_and_uri() -> None:
@@ -129,6 +136,78 @@ def test_prepare_requires_resolution_and_uri() -> None:
 
     with pytest.raises(ValueError, match="resolution and uri"):
         extractor.prepare_for_extraction(gdf)
+
+
+def test_prepare_respects_cells_per_chunk() -> None:
+    """Smaller cells_per_chunk should produce at least as many tasks."""
+    extractor = AwsGoesExtractor()
+    gdf = _make_asset_gdf(1)
+
+    tasks_large = extractor.prepare_for_extraction(
+        gdf, resolution=2000.0, uri="/tmp/test", prepare_params={"cells_per_chunk": 100},
+    )
+    tasks_small = extractor.prepare_for_extraction(
+        gdf, resolution=2000.0, uri="/tmp/test", prepare_params={"cells_per_chunk": 1},
+    )
+    # Fewer cells per chunk → more tasks
+    assert len(tasks_small) >= len(tasks_large)
+def test_prepare_no_duplicate_cells() -> None:
+    """Each grid cell ID must appear in exactly one task (regression for de-dup bug)."""
+    extractor = AwsGoesExtractor()
+    gdf = _make_asset_gdf(1)
+
+    tasks = extractor.prepare_for_extraction(
+        gdf,
+        resolution=2000.0,
+        uri="/tmp/test",
+        prepare_params={"cells_per_chunk": 3},
+    )
+
+    seen: set[str] = set()
+    for task in tasks:
+        cells = task.task_context["grid_cells"]
+        for cell in cells:
+            cell_id = cell.id()
+            assert cell_id not in seen, f"Duplicate cell ID: {cell_id}"
+            seen.add(cell_id)
+
+
+
+def test_split_aoi_single_chunk() -> None:
+    """An AOI smaller than chunk_size should produce exactly one chunk."""
+    from aer.extract_aws_goes.utils import split_aoi_into_chunks
+
+    aoi = box(0, 0, 1, 1)
+    chunks = split_aoi_into_chunks(aoi, chunk_size=5.0)
+    assert len(chunks) == 1
+    assert chunks[0].intersects(aoi)
+
+
+def test_split_aoi_multiple_chunks() -> None:
+    """A 10×10 AOI with chunk_size=5 should produce 4 chunks."""
+    from aer.extract_aws_goes.utils import split_aoi_into_chunks
+
+    aoi = box(0, 0, 10, 10)
+    chunks = split_aoi_into_chunks(aoi, chunk_size=5.0)
+    assert len(chunks) == 4
+    for c in chunks:
+        assert c.intersects(aoi)
+
+
+def test_split_aoi_irregular_shape() -> None:
+    """Chunks outside an L-shaped AOI should be excluded."""
+    from aer.extract_aws_goes.utils import split_aoi_into_chunks
+    from shapely.geometry import Polygon
+
+    # L-shape within a 10×10 bounding box; top-right quadrant is empty
+    # Slightly inset from the (5,5) corner so the top-right chunk doesn't
+    # touch via a shared vertex.
+    l_shape = Polygon([(0, 0), (10, 0), (10, 4.9), (4.9, 4.9), (4.9, 10), (0, 10)])
+    chunks = split_aoi_into_chunks(l_shape, chunk_size=5.0)
+    # The top-right quadrant (5-10, 5-10) does NOT intersect the L-shape
+    assert len(chunks) == 3
+    for c in chunks:
+        assert c.intersects(l_shape)
 
 
 # --- Engine dispatch tests ---
