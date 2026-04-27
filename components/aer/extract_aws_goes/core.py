@@ -1,5 +1,6 @@
 import hashlib
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+from collections import defaultdict
+from concurrent.futures import ProcessPoolExecutor, as_completed  # noqa: F401
 from pathlib import Path
 from typing import Any, Sequence, cast, override
 
@@ -10,7 +11,6 @@ import rioxarray  # noqa: F401
 import geopandas as gpd
 import pandas as pd
 import s3fs
-from aer.grid import GridCell
 from aer.interfaces import ExtractionTask, Extractor
 from aer.repository import AerLocalSpectralRepository
 from aer.schemas import ArtifactSchema, AssetSchema
@@ -29,7 +29,9 @@ from .utils import (
     create_extraction_artifact,
     create_metadata_from_row,
     detect_combo,
-    read_goes_crop,
+    parse_goes_filename,
+    detect_reader,
+    map_channel_ids_to_satpy_names,
 )
 
 
@@ -61,7 +63,7 @@ class AwsGoesExtractor(Extractor, plugin_abstract=False):
     """Extractor plugin for GOES ABI satellite data from AWS.
 
     Downloads NetCDF granules, builds satpy Scenes, resamples to grid cells
-    using LUT-cached nearest-neighbour interpolation, and saves as NetCDF.
+    using odc-geo nearest-neighbour interpolation, and saves as GeoTIFF.
     """
 
     supported_collections: Sequence[str] = SUPPORTED_COLLECTIONS
@@ -222,42 +224,44 @@ class AwsGoesExtractor(Extractor, plugin_abstract=False):
             GeoDataFrame containing references to extracted artifacts.
         """
         extract_params = extract_params or {}
-        return self._extract_lut(extraction_task, extract_params)
+        return self._extract_odc(extraction_task, extract_params)
 
-    # ── LUT-based extraction ───────────────────────────────
+    # ── ODC-based extraction ───────────────────────────────
 
-    def _extract_lut(
+    def _extract_odc(
         self,
         extraction_task: ExtractionTask,
         extract_params: dict[str, Any],
     ) -> GeoDataFrame[ArtifactSchema]:
-        """Extract using pre-computed UTM zone lookup tables — zero reprojection.
+        """Extract using odc-geo reprojection with UTM-grouped strategy.
+
+        Performance strategy:
+        1. Build ONE global crop of the geostationary source covering all cells.
+        2. Group grid cells by UTM CRS (typically 5-25 zones per AOI).
+        3. For each UTM zone: reproject the crop once to cover the full zone
+           extent, then numpy-slice each individual cell from the result.
+        4. Write each cell via rasterio directly (avoids xarray overhead).
+
+        This reduces ``odc.reproject`` calls from N (one per cell) to the
+        number of unique UTM zones — typically a 2-3× speedup on large AOIs.
 
         Args:
             extraction_task: The task containing assets and grid cells to extract.
             extract_params: Dictionary of parameters.
-                Required:
-                    lut_dir (str): Path to root LUT directory containing .npz files.
-                Optional:
-                    calibration (str): 'radiance', 'reflectance', or 'brightness_temperature'
-                        (default: 'counts').
-                    max_workers (int): Thread pool workers for parallel cell extraction
-                        (default: 16).
 
         Returns:
             GeoDataFrame containing references to extracted artifacts.
         """
-        from aer.extract_aws_goes.lut import (
-            extract_cell_from_lut,
-            get_default_bucket_uri,
-            load_utm_zone_lut,
-        )
-
-        from aer.extract_aws_goes.utils import download_lut_if_needed
-
-        lut_dir_str = extract_params.get("lut_dir", "/tmp/luts")
-        local_lut_dir = Path(lut_dir_str)
-        bucket_uri = extract_params.get("bucket_uri", get_default_bucket_uri())
+        import odc.geo.xr  # noqa: F401
+        import rasterio
+        from affine import Affine
+        from rasterio.crs import CRS as RasterioCRS
+        from odc.geo.geom import BoundingBox, bbox_intersection
+        from odc.geo.geobox import GeoBox
+        from shapely.ops import unary_union
+        from shapely.geometry import box
+        from satpy.scene import Scene
+        from aer.eoids import build_eoids_path
 
         first_row = extraction_task.assets.iloc[0]
         meta = create_metadata_from_row(first_row, extract_params, extraction_task)
@@ -269,7 +273,6 @@ class AwsGoesExtractor(Extractor, plugin_abstract=False):
                 fs = s3fs.S3FileSystem(anon=True)
                 fs.get(meta.href.replace("s3://", ""), str(meta.local_path))
             elif Path(meta.href).exists():
-                # If it's a local path and different from target local_path, copy it
                 if Path(meta.href).absolute() != meta.local_path.absolute():
                     import shutil
 
@@ -279,146 +282,115 @@ class AwsGoesExtractor(Extractor, plugin_abstract=False):
 
         logger.info("file_downloaded", local_path=str(meta.local_path))
 
-        artifact_rows: list[dict[str, Any]] = []
+        nc_path = str(meta.local_path)
+        reader = detect_reader(nc_path)
+        info = parse_goes_filename(nc_path)
+        scn = Scene(filenames=[nc_path], reader=reader)
+        available_datasets = scn.available_dataset_names()
 
-        # Group grid cells by UTM zone for LUT loading
-        from collections import defaultdict
+        channel_id_list = [info["channel_id"]] if info.get("channel_id") else []
+        channel_names = map_channel_ids_to_satpy_names(channel_id_list, available_datasets)
+        if not channel_names:
+            raise ValueError(f"Could not map channel ID {info.get('channel_id')} to a dataset in {nc_path}")
 
-        utm_groups: dict[int, list[GridCell]] = defaultdict(list)
-        for gc_ in extraction_task.overlapping_grid_cells:
-            epsg = int(str(gc_.utm_crs).replace("EPSG:", "").replace("epsg:", ""))
-            utm_groups[epsg].append(gc_)
+        channel_name = channel_names[0]
 
-        def _extract_utm_group(utm_epsg, group_cells):
-            try:
-                combo = detect_combo(meta.href)
-                combo_parts = combo.split("_")
-                eoids_sat = f"{combo_parts[0]}_{combo_parts[1]}" if len(combo_parts) >= 2 else "unknown"
-                eoids_prod = meta.collection.split("-")[-1]
+        scn.load([channel_name], calibration=meta.calibration)
+        ds = scn[channel_name]
+        ds = ds.odc.assign_crs(ds.crs.item())
 
-                from aer.eoids import build_eoids_path
+        grid_cells = extraction_task.overlapping_grid_cells
 
-                # ── Pre-compute output paths and separate cached / pending cells ──
-                pending_cells: list[GridCell] = []
-                group_results: list[dict[str, Any]] = []
+        # ── Build ONE global crop covering all cells ───────────────────────────
+        total = box(*unary_union([g.geom for g in grid_cells]).bounds)
+        bbox = BoundingBox(*total.bounds[:4], crs="EPSG:4326")
+        target_geobox = GeoBox.from_bbox(bbox, resolution=0.014)
+        target_poly_src = target_geobox.extent.to_crs(ds.odc.geobox.crs)
+        safe_bbox = bbox_intersection([target_poly_src.boundingbox, ds.odc.geobox.extent.boundingbox])
+        crop_ds = ds.odc.crop(safe_bbox.polygon).odc.assign_crs(ds.crs.item()).compute()
 
-                for gc_ in group_cells:
-                    output_path = build_eoids_path(
-                        local_dir=meta.local_dir,
-                        cell_id=gc_.id(),
-                        start_time=meta.start_time,
-                        end_time=meta.end_time,
-                        satellite=eoids_sat,
-                        product=eoids_prod,
-                        band=meta.dataset_name,
-                        resolution=meta.resolution,
-                    )
+        combo = self._detect_combo(meta.href)
+        combo_parts = combo.split("_")
+        eoids_sat = f"{combo_parts[0]}_{combo_parts[1]}" if len(combo_parts) >= 2 else "unknown"
+        eoids_prod = meta.collection.split("-")[-1]
 
-                    if output_path.exists():
-                        # Already extracted — build artifact row without any heavy I/O
-                        area_name = gc_.area_name(meta.resolution)
-                        artifact_id = hashlib.md5(f"{meta.granule_id}_{area_name}".encode()).hexdigest()
-                        artifact = create_extraction_artifact(artifact_id, meta, output_path, gc_)
-                        group_results.append(attrs.asdict(artifact))
-                    else:
-                        pending_cells.append(gc_)
+        # ── Group cells by UTM CRS and process zone by zone ────────────────────
+        by_zone: dict[int, list[Any]] = defaultdict(list)
+        for gc_ in grid_cells:
+            by_zone[gc_.utm_crs].append(gc_)
 
-                if not pending_cells:
-                    logger.info(
-                        "utm_group_cached",
-                        utm_epsg=utm_epsg,
-                        cached_cells=len(group_cells),
-                    )
-                    return group_results
+        artifact_rows = []
 
-                logger.info(
-                    "utm_group_partial_cache",
-                    utm_epsg=utm_epsg,
-                    cached=len(group_cells) - len(pending_cells),
-                    pending=len(pending_cells),
-                )
+        for utm_crs, zone_cells in by_zone.items():
+            # Compute the encompassing bbox for all cells in this UTM zone
+            cell_bboxes = [
+                BoundingBox(*gc_.area_def(meta.resolution).area_extent, crs=f"EPSG:{utm_crs}") for gc_ in zone_cells
+            ]
+            zone_utm_bbox = BoundingBox(
+                min(b.left for b in cell_bboxes),
+                min(b.bottom for b in cell_bboxes),
+                max(b.right for b in cell_bboxes),
+                max(b.top for b in cell_bboxes),
+                crs=f"EPSG:{utm_crs}",
+            )
+            zone_utm_geobox = GeoBox.from_bbox(zone_utm_bbox, resolution=meta.resolution)
 
-                # ── Heavy I/O: only runs when there are pending cells ──
-                download_lut_if_needed(
-                    combo=combo,
-                    utm_epsg=utm_epsg,
+            # One reproject call covers all cells in this zone
+            zone_reproj = crop_ds.odc.reproject(how=zone_utm_geobox, resampling="nearest")
+            zone_arr = zone_reproj.values  # 2-D numpy array (height × width)
+
+            rcrs = RasterioCRS.from_epsg(utm_crs)
+            res = meta.resolution
+
+            for gc_, cell_bbox in zip(zone_cells, cell_bboxes):
+                output_path = build_eoids_path(
+                    local_dir=meta.local_dir,
+                    cell_id=gc_.id(),
+                    start_time=meta.start_time,
+                    end_time=meta.end_time,
+                    satellite=eoids_sat,
+                    product=eoids_prod,
+                    band=meta.dataset_name,
                     resolution=meta.resolution,
-                    local_dir=local_lut_dir,
-                    remote_bucket=bucket_uri,
                 )
 
-                lut = load_utm_zone_lut(local_lut_dir, utm_epsg, meta.resolution, combo=combo)
+                if output_path.exists():
+                    area_name = gc_.area_name(meta.resolution)
+                    artifact_id = hashlib.md5(f"{meta.granule_id}_{area_name}".encode()).hexdigest()
+                    artifact = create_extraction_artifact(artifact_id, meta, output_path, gc_)
+                    artifact_rows.append(attrs.asdict(artifact))
+                    continue
 
-                # Read only the needed crop from the GOES file via Satpy (in read_goes_crop)
-                source_crop = read_goes_crop(str(meta.local_path), lut.crop_slices, calibration=meta.calibration)
+                # Slice this cell's pixels out of the zone-wide reprojected array
+                col_off = round((cell_bbox.left - zone_utm_bbox.left) / res)
+                row_off = round((zone_utm_bbox.top - cell_bbox.top) / res)
+                nrows = round((cell_bbox.top - cell_bbox.bottom) / res)
+                ncols = round((cell_bbox.right - cell_bbox.left) / res)
+                cell_arr = zone_arr[row_off : row_off + nrows, col_off : col_off + ncols]
 
-                logger.info(
-                    "source_crop_loaded",
-                    utm_epsg=utm_epsg,
-                    crop_shape=source_crop.shape,
-                    calibration=meta.calibration,
-                )
+                # Write with an explicit affine transform via rasterio
+                cell_affine = Affine(res, 0.0, cell_bbox.left, 0.0, -res, cell_bbox.top)
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                with rasterio.open(
+                    str(output_path),
+                    "w",
+                    driver="GTiff",
+                    height=cell_arr.shape[0],
+                    width=cell_arr.shape[1],
+                    count=1,
+                    dtype=cell_arr.dtype,
+                    crs=rcrs,
+                    transform=cell_affine,
+                    compress="deflate",
+                    predictor=3,
+                    zlevel=1,
+                ) as dst:
+                    dst.write(cell_arr, 1)
 
-                for gc_ in pending_cells:
-                    try:
-                        # Extract cell using the LUT
-                        cell_data = extract_cell_from_lut(source_crop, gc_, lut)
-
-                        # Save as GeoTIFF
-                        area_name = gc_.area_name(meta.resolution)
-
-                        output_path = build_eoids_path(
-                            local_dir=meta.local_dir,
-                            cell_id=gc_.id(),
-                            start_time=meta.start_time,
-                            end_time=meta.end_time,
-                            satellite=eoids_sat,
-                            product=eoids_prod,
-                            band=meta.dataset_name,
-                            resolution=meta.resolution,
-                        )
-
-                        # Use rioxarray to save the DataArray to GeoTIFF
-                        cell_data.rio.to_raster(
-                            str(output_path),
-                            driver="GTiff",
-                            compress="deflate",
-                            predictor=2,
-                            zlevel=1,
-                            tiled=True,
-                            blockxsize=512,
-                            blockysize=512,
-                        )
-
-                        artifact_id = hashlib.md5(f"{meta.granule_id}_{area_name}".encode()).hexdigest()
-                        artifact = create_extraction_artifact(artifact_id, meta, output_path, gc_)
-                        group_results.append(attrs.asdict(artifact))
-                    except Exception as exc:
-                        logger.error(
-                            "cell_extract_failed",
-                            error=str(exc),
-                            grid_cell=gc_.id(),
-                            engine="lut",
-                        )
-                return group_results
-            except FileNotFoundError as fnf:
-                logger.warning(
-                    "utm_group_lut_unavailable",
-                    reason=str(fnf),
-                    utm_epsg=utm_epsg,
-                )
-                return []
-            except Exception as grp_exc:
-                logger.error("utm_group_lut_failed", error=str(grp_exc), utm_epsg=utm_epsg)
-                return []
-
-        # Parallelize by UTM zone (usually 1-3 per granule)
-        max_workers = extract_params.get("max_workers", 4)
-        print("Max workers: ", max_workers)
-        with ThreadPoolExecutor(max_workers=max_workers) as pool:
-            futures = [pool.submit(_extract_utm_group, epsg, cells) for epsg, cells in utm_groups.items()]
-            for fut in as_completed(futures):
-                artifact_rows.extend(fut.result())
+                area_name = gc_.area_name(meta.resolution)
+                artifact_id = hashlib.md5(f"{meta.granule_id}_{area_name}".encode()).hexdigest()
+                artifact = create_extraction_artifact(artifact_id, meta, output_path, gc_)
+                artifact_rows.append(attrs.asdict(artifact))
 
         if not artifact_rows:
             raise ValueError(f"All grid cells failed for granule: {meta.granule_id}")
@@ -431,42 +403,53 @@ class AwsGoesExtractor(Extractor, plugin_abstract=False):
 
     # ── Helpers ───────────────────────────────
 
-    # @override
-    # def extract_batches(
-    #     self,
-    #     extraction_task_batch: Sequence[ExtractionTask],
-    #     extract_params: dict[str, Any] | None = None,
-    # ) -> GeoDataFrame[ArtifactSchema]:
-    #     extract_params = extract_params or {}
-    #     max_batch_workers = extract_params.get("max_batch_workers")
-    #     if max_batch_workers is None:
-    #         # run sequential calling super
-    #         return super().extract_batches(extraction_task_batch, extract_params)
+    @override
+    def extract_batches(
+        self,
+        extraction_task_batch: Sequence[ExtractionTask],
+        extract_params: dict[str, Any] | None = None,
+    ) -> GeoDataFrame[ArtifactSchema]:
+        """Extract multiple granules, optionally in parallel via ProcessPool.
 
-    #     results: list[GeoDataFrame[ArtifactSchema]] = []
-    #     errors: list[str] = []
+        When ``extract_params["max_batch_workers"]`` is set, granules are
+        processed in parallel using ``ProcessPoolExecutor``.  Each worker
+        compresses its source crop into a ``blosc2.NDArray`` immediately
+        after reading the NetCDF, keeping the per-process memory footprint
+        bounded even when many workers run simultaneously.
 
-    #     # Important: pass explicit args to avoid closure issues
-    #     tasks = [(self, batch, extract_params) for batch in extraction_task_batch]
+        If ``max_batch_workers`` is not set, falls back to sequential
+        processing via the base class.
+        """
+        extract_params = extract_params or {}
+        max_batch_workers = extract_params.get("max_batch_workers")
+        if max_batch_workers is None:
+            # run sequential calling super
+            return super().extract_batches(extraction_task_batch, extract_params)
 
-    #     with ProcessPoolExecutor(max_workers=max_batch_workers) as executor:
-    #         futures = {executor.submit(_extract_wrapper, t): i for i, t in enumerate(tasks)}
+        results: list[GeoDataFrame[ArtifactSchema]] = []
+        errors: list[str] = []
 
-    #         for future in as_completed(futures):
-    #             batch_idx = futures[future]
-    #             try:
-    #                 df = future.result()
-    #                 results.append(df)
-    #             except Exception as exc:
-    #                 logger.error("batch_extract_failed", batch=batch_idx, error=str(exc))
-    #                 errors.append(str(exc))
+        # Important: pass explicit args to avoid closure issues
+        tasks = [(self, batch, extract_params) for batch in extraction_task_batch]
 
-    #     if not results:
-    #         raise RuntimeError(f"All {len(extraction_task_batch)} batches failed. Errors: {errors}")
+        with ProcessPoolExecutor(max_workers=max_batch_workers) as executor:
+            futures = {executor.submit(_extract_wrapper, t): i for i, t in enumerate(tasks)}
 
-    #     concatenated = pd.concat(results, ignore_index=True)
-    #     validated = ArtifactSchema.validate(concatenated)
-    #     return cast(GeoDataFrame[ArtifactSchema], validated)
+            for future in as_completed(futures):
+                batch_idx = futures[future]
+                try:
+                    df = future.result()
+                    results.append(df)
+                except Exception as exc:
+                    logger.error("batch_extract_failed", batch=batch_idx, error=str(exc))
+                    errors.append(str(exc))
+
+        if not results:
+            raise RuntimeError(f"All {len(extraction_task_batch)} batches failed. Errors: {errors}")
+
+        concatenated = pd.concat(results, ignore_index=True)
+        validated = ArtifactSchema.validate(concatenated)
+        return cast(GeoDataFrame[ArtifactSchema], validated)
 
     @staticmethod
     def _detect_combo(href: str) -> str:

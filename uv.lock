@@ -55,28 +55,34 @@ version = "1.7.0"
 source = { editable = "projects/aer-extract-aws-goes" }
 dependencies = [
     { name = "aer-core" },
+    { name = "blosc2" },
     { name = "h5netcdf", extra = ["h5py"] },
     { name = "huggingface-hub" },
     { name = "netcdf4" },
+    { name = "odc-geo" },
     { name = "pyresample" },
     { name = "rasterio" },
     { name = "rioxarray" },
     { name = "s3fs" },
     { name = "satpy" },
+    { name = "shapely" },
     { name = "xarray" },
 ]
 
 [package.metadata]
 requires-dist = [
     { name = "aer-core", editable = "../aer/projects/aer-core" },
+    { name = "blosc2", specifier = ">=4.1.2" },
     { name = "h5netcdf", extras = ["h5py"], specifier = ">=1.8.1" },
     { name = "huggingface-hub", specifier = ">=1.12.0" },
     { name = "netcdf4", specifier = ">=1.7.4" },
+    { name = "odc-geo", specifier = ">=0.5.1" },
     { name = "pyresample", specifier = ">=1.35.0" },
     { name = "rasterio", specifier = ">=1.5.0" },
     { name = "rioxarray", specifier = ">=0.22.0" },
     { name = "s3fs", specifier = ">=2025.2" },
     { name = "satpy", specifier = ">=0.60.0" },
+    { name = "shapely", specifier = ">=2.1.2" },
     { name = "xarray", specifier = ">=2026.2.0" },
 ]
 
@@ -91,6 +97,7 @@ dependencies = [
     { name = "h5netcdf", extra = ["h5py"] },
     { name = "huggingface-hub" },
     { name = "netcdf4" },
+    { name = "odc-geo" },
     { name = "pyproj" },
     { name = "pyresample" },
     { name = "rasterio" },
@@ -123,6 +130,7 @@ requires-dist = [
     { name = "h5netcdf", extras = ["h5py"], specifier = ">=1.8.1" },
     { name = "huggingface-hub", specifier = ">=1.12.0" },
     { name = "netcdf4", specifier = ">=1.7.4" },
+    { name = "odc-geo", specifier = ">=0.5.1" },
     { name = "pyproj", specifier = ">=3.6.0" },
     { name = "pyresample", specifier = ">=1.35.0" },
     { name = "rasterio", specifier = ">=1.5.0" },

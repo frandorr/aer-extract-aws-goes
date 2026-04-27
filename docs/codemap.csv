@@ -1,15 +1,15 @@
 filepath|summary|public_api|dependencies
 components/aer/extract_aws_goes/utils.py|||
 components/aer/extract_aws_goes/core.py|||
-components/aer/extract_aws_goes/generate_luts.py|Offline GOES→UTM zone LUT generator.  Usage:     python -m aer.extract_aws_goes.generate_luts \         --goes-file /path/to/OR_ABI-L1b-RadF-M6C01_G19_....nc \         --output-dir /path/to/luts/ \         --resolutions 500 1000 2000 \         [--utm-zones 32720 32721 ...]  # optional: specific zones only         [--max-workers 8]  If --utm-zones is not specified, auto-detects all UTM zones intersecting the GOES disk footprint.||
-components/aer/extract_aws_goes/lut.py|||
 development/local/prueba.py|||
 development/local/compare_engines_notebook.py|Engine Comparison Notebook — Full Calibration Comparison ========================================================= Paste each cell (# %%) into Jupyter.  Strategy to avoid re-downloading the NC file 3 times:   1. Satpy extracts first → NC file cached in cmp_satpy/   2. Rasterio extractions point to the SAME nc file via symlink      (TIF filenames are suffixed per calibration to avoid clashes)||
 development/local/compare_and_plot_results.py|||
 development/local/run_extraction.py|Run a single GOES extraction from a SearchResult.  Usage:     # From search results parquet:     python development/local/run_extraction.py results.parquet      # Or configure manually and run:     python development/local/run_extraction.py||
+development/local/verify_lut_vs_satpy.py|||
 development/local/compare_satpy_lut.py|Side-by-side comparison: satpy nearest-neighbor vs LUT crop extraction.  Shows that the LUT extraction is pixel-perfect vs pyresample's get_sample_from_neighbour_info (ground truth), while satpy produces slightly different results because it uses a different source geometry (SwathDefinition with per-pixel lon/lat vs AreaDefinition regular grid).  Usage:     uv run python3 development/local/compare_satpy_lut.py||
 development/local/test_real_lut_generation.py|||
 development/local/test_all_calibrations.py|||
+development/local/debug_alignment.py|Diagnose the coordinate mapping between LUT and cell pixels.||
 development/local/compare_engines.py|||
 development/local/bench_performance.py|||
 development/local/benchmark_lut_engine.py|Benchmark: LUT engine vs rasterio engine for GOES extraction.  Usage:     python development/local/benchmark_lut_engine.py \         --goes-file development/local/OR_ABI-L1b-RadF-*.nc \         --lut-dir development/local/luts_zarr/ \         --resolution 1000 \         --num-cells 10  Compares: 1. engine='rasterio' (current approach - reproj per cell) 2. engine='lut' (new approach - index slicing)||
@@ -20,5 +20,3 @@ development/local/generate_all_luts.py|Generate all GOES LUTs for production use
 development/local/plot_crop_example.py|Minimal end-to-end example of crop-based GOES LUT extraction.  Shows how to: 1. Load a UTM zone LUT 2. Compute the minimal GOES source crop for that zone 3. Read only that crop via h5py (avoids loading 117M pixels) 4. Extract a single 100×100 grid cell from the crop  Run with:     uv run python3 development/local/plot_crop_example.py||
 development/test_lut_extractor.py|||
 test/components/aer/extract_aws_goes/test_core.py|||
-test/components/aer/extract_aws_goes/test_utm_grouping.py|||
-test/components/aer/extract_aws_goes/test_lut.py|||
