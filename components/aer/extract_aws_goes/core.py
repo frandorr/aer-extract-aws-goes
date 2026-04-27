@@ -224,7 +224,10 @@ class AwsGoesExtractor(Extractor, plugin_abstract=False):
 
         Args:
             extraction_task: The task containing assets and grid cells to extract.
-            extract_params: Optional parameters for the extraction engine.
+            extract_params: Optional parameters for the extraction engine. Supports:
+                - ``engine`` (str): The extraction engine to use (default: "odc_cell").
+                - ``resampling`` (str): The resampling method to use (default: "nearest").
+                - ``padding`` (int): Padding to add to the target area (default: 0).
 
         Returns:
             GeoDataFrame containing references to extracted artifacts.
@@ -323,6 +326,7 @@ class AwsGoesExtractor(Extractor, plugin_abstract=False):
         eoids_prod = meta.collection.split("-")[-1]
 
         padding: int = int(extract_params.get("padding", 0))
+        resampling: str = extract_params.get("resampling", "nearest")
 
         # ── Group cells by UTM CRS and process zone by zone ────────────────────
         by_zone: dict[int, list[Any]] = defaultdict(list)
@@ -347,7 +351,7 @@ class AwsGoesExtractor(Extractor, plugin_abstract=False):
             zone_utm_geobox = GeoBox.from_bbox(zone_utm_bbox, resolution=meta.resolution)
 
             # One reproject call covers all cells in this zone
-            zone_reproj = crop_ds.odc.reproject(how=zone_utm_geobox, resampling="nearest", resolution=meta.resolution)
+            zone_reproj = crop_ds.odc.reproject(how=zone_utm_geobox, resampling=resampling, resolution=meta.resolution)
 
             res = meta.resolution
 
@@ -485,6 +489,7 @@ class AwsGoesExtractor(Extractor, plugin_abstract=False):
         artifact_rows = []
 
         padding: int = int(extract_params.get("padding", 0))
+        resampling: str = extract_params.get("resampling", "nearest")
 
         for gc_ in tqdm(grid_cells):
             area_def_obj = gc_.area_def(meta.resolution, padding=padding)
@@ -494,7 +499,7 @@ class AwsGoesExtractor(Extractor, plugin_abstract=False):
             # Direct reproject from global crop using area_def extent (matches reference script)
             cell_bbox = BoundingBox(*area_def_obj.area_extent, crs=f"EPSG:{utm_crs}")
             target_cell_geobox = GeoBox.from_bbox(cell_bbox, resolution=res)
-            cell_reproj = crop_ds.odc.reproject(how=target_cell_geobox, resampling="nearest")
+            cell_reproj = crop_ds.odc.reproject(how=target_cell_geobox, resampling=resampling)
 
             output_path = build_eoids_path(
                 local_dir=meta.local_dir,
@@ -608,6 +613,7 @@ class AwsGoesExtractor(Extractor, plugin_abstract=False):
         artifact_rows = []
 
         padding: int = int(extract_params.get("padding", 0))
+        resampling: str = extract_params.get("resampling", "nearest")
 
         for gc_ in grid_cells:
             area_def_obj = gc_.area_def(meta.resolution, padding=padding)
@@ -618,6 +624,7 @@ class AwsGoesExtractor(Extractor, plugin_abstract=False):
                 target_area,
                 unload=False,
                 generate=False,
+                resampler=resampling,
             )
             cell_da = rsampled_scn[channel_name].compute()
 
