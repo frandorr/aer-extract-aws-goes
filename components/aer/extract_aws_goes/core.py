@@ -356,7 +356,7 @@ class AwsGoesExtractor(Extractor, plugin_abstract=False):
         grid_cells = self._get_grid_cells(extraction_task)
 
         # ── Build ONE global crop covering all cells ───────────────────────────
-        total = box(*unary_union([g.geom for g in grid_cells]).buffer(0.5).bounds)
+        total = box(*unary_union([g.geom for g in grid_cells]).buffer(2.5).bounds)
         bbox = BoundingBox(*total.bounds[:4], crs="EPSG:4326")
         target_geobox = GeoBox.from_bbox(bbox, resolution=0.014)
         target_poly_src = target_geobox.extent.to_crs(ds.odc.geobox.crs)
@@ -517,7 +517,7 @@ class AwsGoesExtractor(Extractor, plugin_abstract=False):
         grid_cells = self._get_grid_cells(extraction_task)
 
         # Build ONE global crop covering all cells
-        total = box(*unary_union([g.geom for g in grid_cells]).buffer(0.5).bounds)
+        total = box(*unary_union([g.geom for g in grid_cells]).buffer(2.5).bounds)
         bbox = BoundingBox(*total.bounds[:4], crs="EPSG:4326")
         target_geobox = GeoBox.from_bbox(bbox, resolution=0.014)
         target_poly_src = target_geobox.extent.to_crs(ds.odc.geobox.crs)
