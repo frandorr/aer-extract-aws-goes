@@ -129,3 +129,67 @@ def test_prepare_requires_resolution_and_uri() -> None:
 
     with pytest.raises(ValueError, match="resolution and uri"):
         extractor.prepare_for_extraction(gdf)
+
+
+# --- Engine dispatch tests ---
+
+
+def test_extract_default_engine_calls_odc_cell() -> None:
+    """extract() with no engine param should call _extract_odc_cell."""
+    from unittest.mock import patch
+
+    extractor = AwsGoesExtractor()
+    with (
+        patch.object(extractor, "_extract_odc_cell", return_value="odc_result") as mock_odc,
+        patch.object(extractor, "_extract_pyresample", return_value="pyresample_result") as mock_pyresample,
+    ):
+        result = extractor.extract("fake_task")  # type: ignore[arg-type]
+
+    mock_odc.assert_called_once_with("fake_task", {})
+    mock_pyresample.assert_not_called()
+    assert result == "odc_result"
+
+
+def test_extract_odc_zone_engine_explicit() -> None:
+    """extract() with engine='odc_zone' should call _extract_odc_zone."""
+    from unittest.mock import patch
+
+    extractor = AwsGoesExtractor()
+    with patch.object(extractor, "_extract_odc_zone", return_value="odc_result") as mock_odc:
+        result = extractor.extract("fake_task", {"engine": "odc_zone"})  # type: ignore[arg-type]
+
+    mock_odc.assert_called_once_with("fake_task", {"engine": "odc_zone"})
+    assert result == "odc_result"
+
+
+def test_extract_pyresample_engine() -> None:
+    """extract() with engine='pyresample' should call _extract_pyresample."""
+    from unittest.mock import patch
+
+    extractor = AwsGoesExtractor()
+    with (
+        patch.object(extractor, "_extract_odc_zone", return_value="odc_result") as mock_odc,
+        patch.object(extractor, "_extract_pyresample", return_value="pyresample_result") as mock_pyresample,
+    ):
+        result = extractor.extract("fake_task", {"engine": "pyresample"})  # type: ignore[arg-type]
+
+    mock_pyresample.assert_called_once_with("fake_task", {"engine": "pyresample"})
+    mock_odc.assert_not_called()
+    assert result == "pyresample_result"
+
+
+def test_extract_odc_cell_engine() -> None:
+    """extract() with engine='odc_cell' should call _extract_odc_cell."""
+    from unittest.mock import patch
+
+    extractor = AwsGoesExtractor()
+    with (
+        patch.object(extractor, "_extract_odc_zone", return_value="odc_result") as mock_odc,
+        patch.object(extractor, "_extract_odc_cell", return_value="naive_result") as mock_naive,
+    ):
+        result = extractor.extract("fake_task", {"engine": "odc_cell"})  # type: ignore[arg-type]
+
+    mock_naive.assert_called_once_with("fake_task", {"engine": "odc_cell"})
+    mock_odc.assert_not_called()
+    assert result == "naive_result"
+

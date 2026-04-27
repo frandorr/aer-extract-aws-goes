@@ -73,6 +73,22 @@ artifacts_df = extractor.extract(
 )
 ```
 
+### 🌍 ODC-Geo Reprojection Engines
+
+For areas where a LUT is not available, or for dynamic reprojection, the plugin provides high-performance engines based on `odc-geo`.
+
+- **`odc_cell` (Default)**: Performs reprojection on a per-grid-cell basis. This is the **fastest** option for small Areas of Interest (AOIs) or when all grid cells fall within a **single UTM zone**, as it avoids the overhead of zone-based grouping.
+- **`odc_zone`**: Groups grid cells by UTM zone and performs one large reprojection per zone, then slices individual cells. This is highly optimized for **large AOIs** spanning multiple UTM zones (e.g., 5+ zones), significantly reducing the number of expensive `odc.reproject` calls.
+- **`pyresample`**: The canonical reference engine. Slowest, but used to verify scientific parity.
+
+```python
+# Extract using the ODC cell engine (default)
+artifacts_df = extractor.extract(
+    task, 
+    extract_params={"engine": "odc_cell"}
+)
+```
+
 #### LUT Distribution
 LUTs are organized as zipped .npz files and published as assets in the GitHub Releases. 
 

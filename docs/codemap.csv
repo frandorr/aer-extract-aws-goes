@@ -12,11 +12,14 @@ development/local/test_all_calibrations.py|||
 development/local/debug_alignment.py|Diagnose the coordinate mapping between LUT and cell pixels.||
 development/local/compare_engines.py|||
 development/local/bench_performance.py|||
+development/local/benchmark_odc_strategies.py|||
 development/local/benchmark_lut_engine.py|Benchmark: LUT engine vs rasterio engine for GOES extraction.  Usage:     python development/local/benchmark_lut_engine.py \         --goes-file development/local/OR_ABI-L1b-RadF-*.nc \         --lut-dir development/local/luts_zarr/ \         --resolution 1000 \         --num-cells 10  Compares: 1. engine='rasterio' (current approach - reproj per cell) 2. engine='lut' (new approach - index slicing)||
 development/local/test_rasterio_engine.py|||
 development/local/benchmark_engines.py|Benchmark: satpy engine vs rasterio/GDAL engine for GOES extraction.  Usage:     uv run python development/local/benchmark_engines.py||
 development/local/debug_rasterio_warp.py|||
 development/local/generate_all_luts.py|Generate all GOES LUTs for production use.  Downloads one sample C01 file per satellite/product combo and generates  all intersecting UTM zone LUTs at 500m, 1000m, 2000m resolution in parallel.  Combos:   - GOES-19 Full Disk  (G19_RadF)   - GOES-19 CONUS      (G19_RadC)   - GOES-18 Full Disk  (G18_RadF)   - GOES-18 CONUS      (G18_RadC)  Usage:     python development/local/generate_all_luts.py [--output-dir luts/] [--max-workers 8]||
+development/local/benchmark_odc_strategies2.py|||
+development/local/profile_odc_extraction.py|||
 development/local/plot_crop_example.py|Minimal end-to-end example of crop-based GOES LUT extraction.  Shows how to: 1. Load a UTM zone LUT 2. Compute the minimal GOES source crop for that zone 3. Read only that crop via h5py (avoids loading 117M pixels) 4. Extract a single 100×100 grid cell from the crop  Run with:     uv run python3 development/local/plot_crop_example.py||
 development/test_lut_extractor.py|||
 test/components/aer/extract_aws_goes/test_core.py|||

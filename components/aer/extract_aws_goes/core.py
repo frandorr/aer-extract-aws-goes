@@ -210,11 +210,17 @@ class AwsGoesExtractor(Extractor, plugin_abstract=False):
     ) -> GeoDataFrame[ArtifactSchema]:
         """Extract GOES data for a batch of assets sharing the same granule.
 
-        Downloads the granule once, then dispatches to either the satpy-based
-        or rasterio/GDAL-based extraction engine.
+        Downloads the granule once, then dispatches to the selected engine.
 
-        Set ``extract_params["engine"] = "gdal"`` for the fastest performance.
-        Other engines: ``"rasterio"``, ``"satpy"`` (default).
+        Engines (set via ``extract_params["engine"]``):
+
+        * ``"odc_cell"`` (default) — per-cell odc-geo reprojection. Simplest and
+          fastest for small AOIs or single-UTM-zone extractions.
+        * ``"odc_zone"`` — UTM-grouped odc-geo reprojection.  Highly optimized
+          for large AOIs spanning multiple UTM zones by grouping cells to
+          minimize reproject calls.
+        * ``"pyresample"`` — simple per-cell satpy resample; slowest but
+          produces the canonical pyresample output as ground-truth reference.
 
         Args:
             extraction_task: The task containing assets and grid cells to extract.
@@ -224,11 +230,16 @@ class AwsGoesExtractor(Extractor, plugin_abstract=False):
             GeoDataFrame containing references to extracted artifacts.
         """
         extract_params = extract_params or {}
-        return self._extract_odc(extraction_task, extract_params)
+        engine = extract_params.get("engine", "odc_cell")
+        if engine == "pyresample":
+            return self._extract_pyresample(extraction_task, extract_params)
+        if engine == "odc_zone":
+            return self._extract_odc_zone(extraction_task, extract_params)
+        return self._extract_odc_cell(extraction_task, extract_params)
 
     # ── ODC-based extraction ───────────────────────────────
 
-    def _extract_odc(
+    def _extract_odc_zone(
         self,
         extraction_task: ExtractionTask,
         extract_params: dict[str, Any],
@@ -239,8 +250,8 @@ class AwsGoesExtractor(Extractor, plugin_abstract=False):
         1. Build ONE global crop of the geostationary source covering all cells.
         2. Group grid cells by UTM CRS (typically 5-25 zones per AOI).
         3. For each UTM zone: reproject the crop once to cover the full zone
-           extent, then numpy-slice each individual cell from the result.
-        4. Write each cell via rasterio directly (avoids xarray overhead).
+           extent, then xarray-slice each individual cell from the result.
+        4. Write each cell via rioxarray ``rio.to_raster()``.
 
         This reduces ``odc.reproject`` calls from N (one per cell) to the
         number of unique UTM zones — typically a 2-3× speedup on large AOIs.
@@ -253,9 +264,6 @@ class AwsGoesExtractor(Extractor, plugin_abstract=False):
             GeoDataFrame containing references to extracted artifacts.
         """
         import odc.geo.xr  # noqa: F401
-        import rasterio
-        from affine import Affine
-        from rasterio.crs import CRS as RasterioCRS
         from odc.geo.geom import BoundingBox, bbox_intersection
         from odc.geo.geobox import GeoBox
         from shapely.ops import unary_union
@@ -314,6 +322,8 @@ class AwsGoesExtractor(Extractor, plugin_abstract=False):
         eoids_sat = f"{combo_parts[0]}_{combo_parts[1]}" if len(combo_parts) >= 2 else "unknown"
         eoids_prod = meta.collection.split("-")[-1]
 
+        padding: int = int(extract_params.get("padding", 0))
+
         # ── Group cells by UTM CRS and process zone by zone ────────────────────
         by_zone: dict[int, list[Any]] = defaultdict(list)
         for gc_ in grid_cells:
@@ -324,7 +334,8 @@ class AwsGoesExtractor(Extractor, plugin_abstract=False):
         for utm_crs, zone_cells in by_zone.items():
             # Compute the encompassing bbox for all cells in this UTM zone
             cell_bboxes = [
-                BoundingBox(*gc_.area_def(meta.resolution).area_extent, crs=f"EPSG:{utm_crs}") for gc_ in zone_cells
+                BoundingBox(*gc_.area_def(meta.resolution, padding=padding).area_extent, crs=f"EPSG:{utm_crs}")
+                for gc_ in zone_cells
             ]
             zone_utm_bbox = BoundingBox(
                 min(b.left for b in cell_bboxes),
@@ -336,10 +347,8 @@ class AwsGoesExtractor(Extractor, plugin_abstract=False):
             zone_utm_geobox = GeoBox.from_bbox(zone_utm_bbox, resolution=meta.resolution)
 
             # One reproject call covers all cells in this zone
-            zone_reproj = crop_ds.odc.reproject(how=zone_utm_geobox, resampling="nearest")
-            zone_arr = zone_reproj.values  # 2-D numpy array (height × width)
+            zone_reproj = crop_ds.odc.reproject(how=zone_utm_geobox, resampling="nearest", resolution=meta.resolution)
 
-            rcrs = RasterioCRS.from_epsg(utm_crs)
             res = meta.resolution
 
             for gc_, cell_bbox in zip(zone_cells, cell_bboxes):
@@ -361,36 +370,288 @@ class AwsGoesExtractor(Extractor, plugin_abstract=False):
                     artifact_rows.append(attrs.asdict(artifact))
                     continue
 
-                # Slice this cell's pixels out of the zone-wide reprojected array
+                # Slice this cell out of the zone-wide reprojected DataArray
                 col_off = round((cell_bbox.left - zone_utm_bbox.left) / res)
                 row_off = round((zone_utm_bbox.top - cell_bbox.top) / res)
                 nrows = round((cell_bbox.top - cell_bbox.bottom) / res)
                 ncols = round((cell_bbox.right - cell_bbox.left) / res)
-                cell_arr = zone_arr[row_off : row_off + nrows, col_off : col_off + ncols]
+                cell_da = zone_reproj.isel(
+                    y=slice(row_off, row_off + nrows),
+                    x=slice(col_off, col_off + ncols),
+                )
 
-                # Write with an explicit affine transform via rasterio
-                cell_affine = Affine(res, 0.0, cell_bbox.left, 0.0, -res, cell_bbox.top)
                 output_path.parent.mkdir(parents=True, exist_ok=True)
-                with rasterio.open(
+                cell_da.rio.to_raster(
                     str(output_path),
-                    "w",
                     driver="GTiff",
-                    height=cell_arr.shape[0],
-                    width=cell_arr.shape[1],
-                    count=1,
-                    dtype=cell_arr.dtype,
-                    crs=rcrs,
-                    transform=cell_affine,
                     compress="deflate",
                     predictor=3,
                     zlevel=1,
-                ) as dst:
-                    dst.write(cell_arr, 1)
+                )
 
                 area_name = gc_.area_name(meta.resolution)
                 artifact_id = hashlib.md5(f"{meta.granule_id}_{area_name}".encode()).hexdigest()
                 artifact = create_extraction_artifact(artifact_id, meta, output_path, gc_)
                 artifact_rows.append(attrs.asdict(artifact))
+
+        if not artifact_rows:
+            raise ValueError(f"All grid cells failed for granule: {meta.granule_id}")
+
+        if meta.local_path.exists():
+            meta.local_path.unlink()
+
+        gdf = gpd.GeoDataFrame(artifact_rows, geometry="geometry")
+        return cast(GeoDataFrame[ArtifactSchema], ArtifactSchema.validate(gdf))
+
+    # ── ODC-cell extraction (per-cell, no UTM grouping) ───────────────
+
+    def _extract_odc_cell(
+        self,
+        extraction_task: ExtractionTask,
+        extract_params: dict[str, Any],
+    ) -> GeoDataFrame[ArtifactSchema]:
+        """Extract using odc-geo reprojection — one reproject per grid cell.
+
+        Unlike :meth:`_extract_odc_zone` this does **not** group cells by UTM zone.
+        Each cell gets its own ``odc.reproject`` call from the global crop.
+        This approach is typically faster for small AOIs or extractions
+        contained within a single UTM zone due to reduced overhead.
+
+        Args:
+            extraction_task: The task containing assets and grid cells to extract.
+            extract_params: Dictionary of parameters.
+
+        Returns:
+            GeoDataFrame containing references to extracted artifacts.
+        """
+        import odc.geo.xr  # noqa: F401
+        from odc.geo.geom import BoundingBox, bbox_intersection
+        from odc.geo.geobox import GeoBox
+        from shapely.ops import unary_union
+        from shapely.geometry import box
+        from satpy.scene import Scene
+        from aer.eoids import build_eoids_path
+        from tqdm import tqdm
+
+        first_row = extraction_task.assets.iloc[0]
+        meta = create_metadata_from_row(first_row, extract_params, extraction_task)
+
+        # Download from S3 (or copy if local)
+        meta.local_dir.mkdir(parents=True, exist_ok=True)
+        if not meta.local_path.exists():
+            if meta.href.startswith("s3://"):
+                fs = s3fs.S3FileSystem(anon=True)
+                fs.get(meta.href.replace("s3://", ""), str(meta.local_path))
+            elif Path(meta.href).exists():
+                if Path(meta.href).absolute() != meta.local_path.absolute():
+                    import shutil
+
+                    shutil.copy(meta.href, meta.local_path)
+            else:
+                raise FileNotFoundError(f"Source file not found at {meta.href}")
+
+        logger.info("file_downloaded", local_path=str(meta.local_path), engine="odc_naive")
+
+        nc_path = str(meta.local_path)
+        reader = detect_reader(nc_path)
+        info = parse_goes_filename(nc_path)
+        scn = Scene(filenames=[nc_path], reader=reader)
+        available_datasets = scn.available_dataset_names()
+
+        channel_id_list = [info["channel_id"]] if info.get("channel_id") else []
+        channel_names = map_channel_ids_to_satpy_names(channel_id_list, available_datasets)
+        if not channel_names:
+            raise ValueError(f"Could not map channel ID {info.get('channel_id')} to a dataset in {nc_path}")
+
+        channel_name = channel_names[0]
+        scn.load([channel_name], calibration=meta.calibration)
+        ds = scn[channel_name]
+        ds = ds.odc.assign_crs(ds.crs.item())
+
+        grid_cells = extraction_task.overlapping_grid_cells
+
+        # Build ONE global crop covering all cells
+        total = box(*unary_union([g.geom for g in grid_cells]).bounds)
+        bbox = BoundingBox(*total.bounds[:4], crs="EPSG:4326")
+        target_geobox = GeoBox.from_bbox(bbox, resolution=0.014)
+        target_poly_src = target_geobox.extent.to_crs(ds.odc.geobox.crs)
+        safe_bbox = bbox_intersection([target_poly_src.boundingbox, ds.odc.geobox.extent.boundingbox])
+        crop_ds = ds.odc.crop(safe_bbox.polygon).odc.assign_crs(ds.crs.item()).compute()
+        combo = self._detect_combo(meta.href)
+        combo_parts = combo.split("_")
+        eoids_sat = f"{combo_parts[0]}_{combo_parts[1]}" if len(combo_parts) >= 2 else "unknown"
+        eoids_prod = meta.collection.split("-")[-1]
+
+        artifact_rows = []
+
+        padding: int = int(extract_params.get("padding", 0))
+
+        for gc_ in tqdm(grid_cells):
+            area_def_obj = gc_.area_def(meta.resolution, padding=padding)
+            utm_crs = gc_.utm_crs
+            res = meta.resolution
+
+            # Direct reproject from global crop using area_def extent (matches reference script)
+            cell_bbox = BoundingBox(*area_def_obj.area_extent, crs=f"EPSG:{utm_crs}")
+            target_cell_geobox = GeoBox.from_bbox(cell_bbox, resolution=res)
+            cell_reproj = crop_ds.odc.reproject(how=target_cell_geobox, resampling="nearest")
+
+            output_path = build_eoids_path(
+                local_dir=meta.local_dir,
+                cell_id=gc_.id(),
+                start_time=meta.start_time,
+                end_time=meta.end_time,
+                satellite=eoids_sat,
+                product=eoids_prod,
+                band=meta.dataset_name,
+                resolution=meta.resolution,
+            )
+
+            if output_path.exists():
+                area_name = gc_.area_name(meta.resolution)
+                artifact_id = hashlib.md5(f"{meta.granule_id}_{area_name}".encode()).hexdigest()
+                artifact = create_extraction_artifact(artifact_id, meta, output_path, gc_)
+                artifact_rows.append(attrs.asdict(artifact))
+                continue
+
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            cell_reproj.rio.to_raster(
+                str(output_path),
+                driver="GTiff",
+                compress="deflate",
+                predictor=3,
+                zlevel=1,
+            )
+
+            area_name = gc_.area_name(meta.resolution)
+            artifact_id = hashlib.md5(f"{meta.granule_id}_{area_name}".encode()).hexdigest()
+            artifact = create_extraction_artifact(artifact_id, meta, output_path, gc_)
+            artifact_rows.append(attrs.asdict(artifact))
+
+        if not artifact_rows:
+            raise ValueError(f"All grid cells failed for granule: {meta.granule_id}")
+
+        if meta.local_path.exists():
+            meta.local_path.unlink()
+
+        gdf = gpd.GeoDataFrame(artifact_rows, geometry="geometry")
+        return cast(GeoDataFrame[ArtifactSchema], ArtifactSchema.validate(gdf))
+
+    # ── Pyresample-based extraction (reference / ground-truth) ──────────
+
+    def _extract_pyresample(
+        self,
+        extraction_task: ExtractionTask,
+        extract_params: dict[str, Any],
+    ) -> GeoDataFrame[ArtifactSchema]:
+        """Extract using satpy Scene.resample() with pyresample AreaDefinitions.
+
+        This is the *simplest* extraction path: for every grid cell we build a
+        pyresample ``AreaDefinition`` from the cell's YAML, call
+        ``scn.resample(area_def)``, and write the result to GeoTIFF.
+
+        It is **much slower** than :meth:`_extract_odc` (one resample call per
+        cell rather than per UTM zone), but produces the canonical pyresample
+        nearest-neighbour output that can be used as a ground-truth reference.
+
+        Args:
+            extraction_task: The task containing assets and grid cells to extract.
+            extract_params: Dictionary of parameters.
+
+        Returns:
+            GeoDataFrame containing references to extracted artifacts.
+        """
+        from pyresample.area_config import load_area_from_string
+        from satpy.scene import Scene
+        from aer.eoids import build_eoids_path
+
+        first_row = extraction_task.assets.iloc[0]
+        meta = create_metadata_from_row(first_row, extract_params, extraction_task)
+
+        # Download from S3 (or copy if local)
+        meta.local_dir.mkdir(parents=True, exist_ok=True)
+        if not meta.local_path.exists():
+            if meta.href.startswith("s3://"):
+                fs = s3fs.S3FileSystem(anon=True)
+                fs.get(meta.href.replace("s3://", ""), str(meta.local_path))
+            elif Path(meta.href).exists():
+                if Path(meta.href).absolute() != meta.local_path.absolute():
+                    import shutil
+
+                    shutil.copy(meta.href, meta.local_path)
+            else:
+                raise FileNotFoundError(f"Source file not found at {meta.href}")
+
+        logger.info("file_downloaded", local_path=str(meta.local_path), engine="pyresample")
+
+        nc_path = str(meta.local_path)
+        reader = detect_reader(nc_path)
+        info = parse_goes_filename(nc_path)
+        scn = Scene(filenames=[nc_path], reader=reader)
+        available_datasets = scn.available_dataset_names()
+
+        channel_id_list = [info["channel_id"]] if info.get("channel_id") else []
+        channel_names = map_channel_ids_to_satpy_names(channel_id_list, available_datasets)
+        if not channel_names:
+            raise ValueError(f"Could not map channel ID {info.get('channel_id')} to a dataset in {nc_path}")
+
+        channel_name = channel_names[0]
+        scn.load([channel_name], calibration=meta.calibration)
+
+        grid_cells = extraction_task.overlapping_grid_cells
+
+        combo = self._detect_combo(meta.href)
+        combo_parts = combo.split("_")
+        eoids_sat = f"{combo_parts[0]}_{combo_parts[1]}" if len(combo_parts) >= 2 else "unknown"
+        eoids_prod = meta.collection.split("-")[-1]
+
+        artifact_rows = []
+
+        padding: int = int(extract_params.get("padding", 0))
+
+        for gc_ in grid_cells:
+            area_def_obj = gc_.area_def(meta.resolution, padding=padding)
+            area_yaml = area_def_obj.to_yaml()
+            target_area = load_area_from_string(area_yaml, area_def_obj.area_id)
+
+            rsampled_scn = scn.resample(
+                target_area,
+                unload=False,
+                generate=False,
+            )
+            cell_da = rsampled_scn[channel_name].compute()
+
+            output_path = build_eoids_path(
+                local_dir=meta.local_dir,
+                cell_id=gc_.id(),
+                start_time=meta.start_time,
+                end_time=meta.end_time,
+                satellite=eoids_sat,
+                product=eoids_prod,
+                band=meta.dataset_name,
+                resolution=meta.resolution,
+            )
+
+            if output_path.exists():
+                area_name = gc_.area_name(meta.resolution)
+                artifact_id = hashlib.md5(f"{meta.granule_id}_{area_name}".encode()).hexdigest()
+                artifact = create_extraction_artifact(artifact_id, meta, output_path, gc_)
+                artifact_rows.append(attrs.asdict(artifact))
+                continue
+
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            cell_da.rio.to_raster(
+                str(output_path),
+                driver="GTiff",
+                compress="deflate",
+                predictor=3,
+                zlevel=1,
+            )
+
+            area_name = gc_.area_name(meta.resolution)
+            artifact_id = hashlib.md5(f"{meta.granule_id}_{area_name}".encode()).hexdigest()
+            artifact = create_extraction_artifact(artifact_id, meta, output_path, gc_)
+            artifact_rows.append(attrs.asdict(artifact))
 
         if not artifact_rows:
             raise ValueError(f"All grid cells failed for granule: {meta.granule_id}")
