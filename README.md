@@ -82,12 +82,23 @@ For areas where a LUT is not available, or for dynamic reprojection, the plugin 
 - **`pyresample`**: The canonical reference engine. Slowest, but used to verify scientific parity.
 
 ```python
-# Extract using the ODC cell engine (default)
+# Extract using the ODC cell engine (default) with custom resampling
 artifacts_df = extractor.extract(
     task, 
-    extract_params={"engine": "odc_cell"}
+    extract_params={
+        "engine": "odc_cell",
+        "resampling": "bilinear" # default is "nearest"
+    }
 )
 ```
+
+#### Resampling Differences
+
+You can specify the `resampling` method (e.g., `"nearest"`, `"bilinear"`) in the `extract_params`. Note that the underlying algorithms (such as `odc.reproject` vs `satpy.Scene.resample`) can vary slightly in their implementation. As a result, different engines might produce minor visual and numerical differences in the extracted images, even when using the same resampling strategy.
+
+Below is an example showing the numerical difference between ODC and Pyresample outputs:
+
+![Engine Comparison](docs/images/engine_comparison.png)
 
 #### LUT Distribution
 LUTs are organized as zipped .npz files and published as assets in the GitHub Releases. 
